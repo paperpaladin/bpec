@@ -106,5 +106,60 @@ else
 	skip "bpec is not built yet, so only the oracle side ran"
 fi
 
+# --------------------------------------------- reading the tokenizer file
+if [ -x ./bpec ]; then
+	want_v=$("$VENV/bin/python" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["model"]["vocab"]))' "$TOK")
+	want_m=$("$VENV/bin/python" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["model"]["merges"]))' "$TOK")
+	got=$(./bpec --load "$TOK")
+	eq "the vocabulary size is the file's" "vocab $want_v" "$(echo "$got" | sed -n 1p)"
+	eq "the merge count is the file's" "merges $want_m" "$(echo "$got" | sed -n 2p)"
+
+	# Every unimplemented field must be refused BY NAME. A field quietly
+	# ignored produces wrong ids for every input it would have touched,
+	# and nothing fails until someone compares against the reference.
+	# Each case is the real tokenizer file with one field changed.
+	mkdir -p scratch/bad
+	refuses() { # name, python edit, expected substring in the message
+		"$VENV/bin/python" -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+$2
+json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
+" "$TOK" "scratch/bad/$1.json" || { nok "refuses $1" "could not build the case"; return 0; }
+		out=$(./bpec --load "scratch/bad/$1.json" 2>&1)
+		st=$?
+		if [ "$st" -eq 0 ]; then
+			nok "refuses $1" "it was accepted"
+		elif ! printf '%s' "$out" | grep -q "$3"; then
+			nok "refuses $1" "message did not mention $3: $out"
+		else
+			ok "refuses $1, by name"
+		fi
+	}
+	refuses normalizer "d['normalizer'] = {'type': 'NFC'}" "normalizer"
+	refuses wordpiece "d['model']['type'] = 'WordPiece'" "WordPiece"
+	refuses dropout "d['model']['dropout'] = 0.1" "dropout"
+	refuses unk "d['model']['unk_token'] = '<unk>'" "unk_token"
+	refuses suffix "d['model']['end_of_word_suffix'] = '</w>'" "end_of_word_suffix"
+	refuses pretok "d['pre_tokenizer'] = {'type': 'Whitespace'}" "Whitespace"
+
+	# A \u escape decoded wrongly would corrupt exactly the non-ASCII
+	# vocabulary entries that byte-level BPE depends on, so it is
+	# refused rather than guessed at. ensure_ascii writes every one of
+	# them as \uXXXX, which makes the whole file a test case.
+	"$VENV/bin/python" -c "
+import json, sys
+json.dump(json.load(open(sys.argv[1])), open(sys.argv[2], 'w'), ensure_ascii=True)
+" "$TOK" scratch/bad/uesc.json
+	out=$(./bpec --load scratch/bad/uesc.json 2>&1)
+	if [ $? -eq 0 ]; then
+		nok "refuses a file written with backslash-u escapes" "it was accepted"
+	elif printf '%s' "$out" | grep -q 'u escapes'; then
+		ok "refuses a file written with backslash-u escapes, by name"
+	else
+		nok "refuses a file written with backslash-u escapes" "$out"
+	fi
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
