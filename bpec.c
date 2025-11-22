@@ -17,6 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "classes.h"
+
 /* Byte-level BPE does not feed raw bytes to the merge table. It maps
  * each of the 256 byte values to one printable codepoint first, so that
  * the merge table is over characters with no whitespace or control
@@ -425,10 +427,199 @@ static int load_tokenizer(const char *path)
 	return 1;
 }
 
+
+/* ------------------------------------------------- the pre-tokenizer
+ *
+ * GPT-2 splits text before any merging, with this pattern:
+ *
+ *   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+ *
+ * Alternation is first match wins, left to right, so the order below is
+ * the pattern's order and changing it changes the answer. This is where
+ * exactness is won or lost: get the split wrong and every id after it is
+ * wrong, with the merge table working perfectly on the wrong pieces.
+ *
+ * Hand written rather than run through a regex engine. The pattern is
+ * fixed and five of its six alternatives are a character class and a
+ * plus, so a scanner is smaller than an engine and has no lookahead
+ * machinery to get wrong. The one construct that needs care is
+ * \s+(?!\S), and it gets its own comment below.
+ */
+
+static int in_ranges(unsigned cp, const CpRange *r, size_t n)
+{
+	size_t lo = 0, hi = n;
+
+	while (lo < hi) {
+		size_t mid = (lo + hi) / 2;
+		if (cp < r[mid].lo) hi = mid;
+		else if (cp > r[mid].hi) lo = mid + 1;
+		else return 1;
+	}
+	return 0;
+}
+
+static int is_letter(unsigned cp) { return in_ranges(cp, uni_letter, UNI_LETTER_N); }
+static int is_number(unsigned cp) { return in_ranges(cp, uni_number, UNI_NUMBER_N); }
+static int is_space(unsigned cp)  { return in_ranges(cp, uni_space,  UNI_SPACE_N); }
+
+/* One UTF-8 codepoint. Returns its length, or 0 for anything malformed.
+ * Malformed input is not an error here: the byte-level mapping is
+ * defined for all 256 byte values, so a bad byte is a one-byte piece
+ * that merges like any other. Refusing it would make bpec unable to
+ * tokenise exactly the inputs that byte-level BPE exists to handle. */
+static int utf8_next(const unsigned char *p, size_t n, unsigned *cp)
+{
+	if (n == 0) return 0;
+	if (p[0] < 0x80) { *cp = p[0]; return 1; }
+	if ((p[0] & 0xE0) == 0xC0 && n >= 2 && (p[1] & 0xC0) == 0x80) {
+		*cp = (unsigned)(p[0] & 0x1F) << 6 | (p[1] & 0x3F);
+		return *cp >= 0x80 ? 2 : 0;
+	}
+	if ((p[0] & 0xF0) == 0xE0 && n >= 3 &&
+	    (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+		*cp = (unsigned)(p[0] & 0x0F) << 12 | (unsigned)(p[1] & 0x3F) << 6 |
+		      (p[2] & 0x3F);
+		return (*cp >= 0x800 && !(*cp >= 0xD800 && *cp <= 0xDFFF)) ? 3 : 0;
+	}
+	if ((p[0] & 0xF8) == 0xF0 && n >= 4 && (p[1] & 0xC0) == 0x80 &&
+	    (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+		*cp = (unsigned)(p[0] & 0x07) << 18 | (unsigned)(p[1] & 0x3F) << 12 |
+		      (unsigned)(p[2] & 0x3F) << 6 | (p[3] & 0x3F);
+		return (*cp >= 0x10000 && *cp <= 0x10FFFF) ? 4 : 0;
+	}
+	return 0;
+}
+
+/* How many bytes a run of class `cls` occupies starting at p. A byte
+ * that is not valid UTF-8 belongs to no Unicode class, so it ends every
+ * run, which is what puts it in the "everything else" alternative. */
+static size_t run_of(const unsigned char *p, size_t n, int (*cls)(unsigned))
+{
+	size_t i = 0;
+
+	while (i < n) {
+		unsigned cp;
+		int len = utf8_next(p + i, n - i, &cp);
+		if (len == 0 || !cls(cp)) break;
+		i += (size_t)len;
+	}
+	return i;
+}
+
+static size_t run_of_other(const unsigned char *p, size_t n)
+{
+	size_t i = 0;
+
+	while (i < n) {
+		unsigned cp;
+		int len = utf8_next(p + i, n - i, &cp);
+		if (len == 0) { i += 1; continue; }   /* a stray byte is "other" */
+		if (is_space(cp) || is_letter(cp) || is_number(cp)) break;
+		i += (size_t)len;
+	}
+	return i;
+}
+
+static const char *const CONTRACTIONS[] = {
+	"'s", "'t", "'re", "'ve", "'m", "'ll", "'d",
+};
+
+/* The length of the next piece, which is never zero for a non-empty
+ * input. */
+static size_t next_piece(const unsigned char *p, size_t n)
+{
+	size_t i, k, sp;
+	unsigned cp;
+
+	for (i = 0; i < sizeof CONTRACTIONS / sizeof *CONTRACTIONS; i++) {
+		size_t len = strlen(CONTRACTIONS[i]);
+		if (n >= len && !memcmp(p, CONTRACTIONS[i], len)) return len;
+	}
+
+	/* " ?" is one ASCII space, and only when something of the right
+	 * class follows it. A space with nothing after it falls through to
+	 * the whitespace alternatives, which is why "  two" splits as
+	 * "Ġ" then "Ġtwo" and not as "ĠĠtwo". */
+	sp = (n > 0 && p[0] == ' ') ? 1 : 0;
+
+	if ((k = run_of(p + sp, n - sp, is_letter)) > 0) return sp + k;
+	if ((k = run_of(p + sp, n - sp, is_number)) > 0) return sp + k;
+	if ((k = run_of_other(p + sp, n - sp)) > 0)      return sp + k;
+
+	k = run_of(p, n, is_space);
+	if (k > 0) {
+		/* Where the run's LAST codepoint starts. The lookahead
+		 * backtracks by one character and this is a byte offset, so
+		 * subtracting 1 splits a multi-byte space down the middle:
+		 * U+00A0 came out as two pieces where the reference gives
+		 * one. Found by the corpus, not by reading. */
+		size_t last = 0, j = 0;
+		while (j < k) {
+			unsigned c2;
+			int len = utf8_next(p + j, k - j, &c2);
+			if (len == 0) break;
+			last = j;
+			j += (size_t)len;
+		}
+		/* \s+(?!\S) before plain \s+. The engine takes the longest
+		 * run, finds the lookahead fails because a non-space
+		 * follows, and backtracks one character at a time until it
+		 * holds. The lookahead holds at end of input, or when the
+		 * next character is itself whitespace, so the answer is the
+		 * whole run when it reaches the end and one less otherwise.
+		 * That single character is why "a  \n b" splits its gap as
+		 * "ĠĠĊ" and leaves the final space to join "Ġb". */
+		if (k == n) return k;
+		if (last > 0) return last;
+		return k;      /* a single character, then a non-space: plain \s+ */
+	}
+
+	/* Not valid UTF-8 and not matched above: one byte, so that the
+	 * scanner always advances. */
+	(void)cp;
+	return 1;
+}
+
+/* Write one piece byte-level encoded: each byte becomes its mapped
+ * codepoint, emitted as UTF-8. */
+static void put_encoded(const unsigned char *p, size_t n, FILE *out)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		unsigned cp = (unsigned)byte_to_cp[p[i]];
+		if (cp < 0x80) {
+			fputc((int)cp, out);
+		} else if (cp < 0x800) {
+			fputc((int)(0xC0 | (cp >> 6)), out);
+			fputc((int)(0x80 | (cp & 0x3F)), out);
+		} else {
+			fputc((int)(0xE0 | (cp >> 12)), out);
+			fputc((int)(0x80 | ((cp >> 6) & 0x3F)), out);
+			fputc((int)(0x80 | (cp & 0x3F)), out);
+		}
+	}
+}
+
+static void split_stdin(void)
+{
+	static unsigned char buf[1 << 20];
+	size_t n = fread(buf, 1, sizeof buf, stdin), i = 0;
+
+	while (i < n) {
+		size_t len = next_piece(buf + i, n - i);
+		put_encoded(buf + i, len, stdout);
+		fputc('\n', stdout);
+		i += len;
+	}
+}
+
 static void usage(void)
 {
 	fputs("usage: bpec --alphabet\n"
-	      "       bpec --load TOKENIZER_JSON\n", stderr);
+	      "       bpec --load TOKENIZER_JSON\n"
+	      "       bpec --split   (text on stdin, one piece per line)\n", stderr);
 }
 
 int main(int argc, char **argv)
@@ -446,6 +637,10 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(argv[1], "--alphabet")) {
 		print_alphabet();
+		return 0;
+	}
+	if (!strcmp(argv[1], "--split")) {
+		split_stdin();
 		return 0;
 	}
 	usage();

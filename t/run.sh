@@ -161,5 +161,21 @@ json.dump(json.load(open(sys.argv[1])), open(sys.argv[2], 'w'), ensure_ascii=Tru
 	fi
 fi
 
+# ------------------------------------------------- the pre-tokenizer split
+# Compared split by split, before any merging. A wrong split produces
+# wrong ids with a merge table that is working perfectly, so a failure
+# here has to say "the split is wrong" and not "the ids differ".
+if [ -x ./bpec ]; then
+	out=$("$VENV/bin/python" t/split_cmp.py ./bpec 2000 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "$line"
+	else
+		nok "$line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
