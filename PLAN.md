@@ -137,12 +137,42 @@ repeatedly.
             test. Two other mutants are caught: dropping the `'ll`
             contraction, and keeping the whole whitespace run instead
             of backtracking.
-- [ ] 05 the BPE merge loop, rank-ordered
+- [x] 05 the BPE merge loop, rank-ordered
       why: the core, and meaningless without 04 feeding it the right
            pieces.
-- [ ] 06 added and special tokens
+      files: bpec.c t/encode_cmp.py t/run.sh
+      proves: 3789 of 3789 inputs produce identical ids, 64848 tokens
+              compared. Three sources: the fixed traps, 2000 random
+              strings over class boundaries, and every line of this
+              repository's own C, Markdown, shell and Python, which is
+              where the merge table is actually exercised since random
+              strings rarely contain a sequence the merges were
+              trained on.
+      found: two mutants killed hard. Merging the highest ranked pair
+             instead of the lowest drops agreement to 483 of 1873.
+             Taking the first mergeable pair and ignoring rank drops it
+             to 606. Rank order is the algorithm.
+      note: quadratic per piece, marked `shortcut:`. Pieces are words,
+            so the constant is a handful of symbols.
+- [x] 06 added and special tokens
       why: `<|endoftext|>` must survive as one id and must not be
            reachable by merging ordinary text.
+      files: bpec.c
+      proves: with added tokens unmatched, 1869 of 1873 instead of
+              1873. A small mutant, and the right size: only inputs
+              containing one can see it.
+      found: the first version probed for added tokens at
+             pre-tokenizer piece boundaries, which misses every token
+             that does not start one. In "\"<|endoftext|>\"" the
+             punctuation run matches "\"<|" and steps over the start,
+             so the token came out as ordinary text. The input is
+             split on added tokens now, earliest match first and
+             longest at that position. Three corpus inputs caught it
+             and none of the hand-written cases did, because every one
+             of those put the token after a letter.
+      note: lstrip, rstrip and single_word are refused by name. Each
+            changes which text the token matches, and GPT-2 sets all
+            three false.
 - [ ] 07 a corpus sweep: every line of a few megabytes of real text,
       ids compared
       why: the number this project lives or dies by. Millions of

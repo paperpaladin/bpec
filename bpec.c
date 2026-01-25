@@ -184,6 +184,14 @@ static Vocab *vocab;
 static size_t vocab_n;
 static Merge *merges;
 static int refused;   /* an unimplemented field was named and rejected */
+
+/* Added tokens are matched against the raw input BEFORE the
+ * pre-tokenizer sees it, and their id is emitted whole. They are not
+ * reachable by merging: "<|endoftext|>" tokenises as ordinary text if
+ * it is not matched here first, which is what the suite caught. */
+typedef struct { char *content; int id; } Added;
+static Added *added;
+static size_t added_n;
 static size_t merges_n;
 
 static char *xdup(const char *s, size_t n)
@@ -362,6 +370,63 @@ static int load_tokenizer(const char *path)
 			 * output at all, which is the least useful thing a
 			 * program can do. */
 			if (!load_model(&j)) break;
+		} else if (!strcmp(key, "added_tokens")) {
+			char content[1024];
+			int id = -1;
+			size_t cap = 16;
+			added = malloc(cap * sizeof *added);
+			if (!added) { fputs("bpec: out of memory\n", stderr); exit(1); }
+			if (!jtake(&j, '[')) { jerr(&j, "added_tokens is not an array"); break; }
+			if (!jtake(&j, ']')) for (;;) {
+				int bad_flag = 0;
+				content[0] = 0; id = -1;
+				if (!jtake(&j, '{')) { jerr(&j, "added token is not an object"); break; }
+				if (!jtake(&j, '}')) for (;;) {
+					if (!jstring(&j, key, sizeof key, &klen)) break;
+					if (!jtake(&j, ':')) { jerr(&j, "expected ':'"); break; }
+					if (!strcmp(key, "content")) {
+						if (!jstring(&j, content, sizeof content, &vlen)) break;
+					} else if (!strcmp(key, "id")) {
+						jspace(&j);
+						id = (int)strtol(j.p, (char **)&j.p, 10);
+					} else if (!strcmp(key, "lstrip") || !strcmp(key, "rstrip") ||
+					           !strcmp(key, "single_word")) {
+						/* Each of these changes which text the token
+						 * matches. GPT-2 sets all three false; a file
+						 * that sets one is refused rather than matched
+						 * as if it had not. */
+						jspace(&j);
+						if (j.end - j.p >= 4 && !strncmp(j.p, "true", 4))
+							bad_flag = 1;
+						if (!jskip(&j)) break;
+					} else if (!jskip(&j)) break;
+					if (jtake(&j, ',')) continue;
+					if (jtake(&j, '}')) break;
+					jerr(&j, "expected ',' or '}' in an added token");
+					break;
+				}
+				if (bad_flag) {
+					fprintf(stderr, "bpec: added token \"%s\" sets lstrip, "
+					        "rstrip or single_word, which is not implemented\n",
+					        content);
+					refused = 1;
+					return 0;
+				}
+				if (content[0] && id >= 0) {
+					if (added_n == cap) {
+						cap *= 2;
+						added = realloc(added, cap * sizeof *added);
+						if (!added) { fputs("bpec: out of memory\n", stderr); exit(1); }
+					}
+					added[added_n].content = xdup(content, strlen(content));
+					added[added_n].id = id;
+					added_n++;
+				}
+				if (jtake(&j, ',')) continue;
+				if (jtake(&j, ']')) break;
+				jerr(&j, "expected ',' or ']' in added_tokens");
+				break;
+			}
 		} else if (!strcmp(key, "normalizer")) {
 			if (!want_null(&j, "normalizer")) return 0;
 		} else if (!strcmp(key, "pre_tokenizer")) {
@@ -581,25 +646,38 @@ static size_t next_piece(const unsigned char *p, size_t n)
 	return 1;
 }
 
-/* Write one piece byte-level encoded: each byte becomes its mapped
- * codepoint, emitted as UTF-8. */
-static void put_encoded(const unsigned char *p, size_t n, FILE *out)
+/* One piece byte-level encoded into `out`: each byte becomes its mapped
+ * codepoint, written as UTF-8. Returns the length, or 0 if it would not
+ * fit. Into a buffer rather than a FILE so the merge loop can use it
+ * without fmemopen, which is a glibc extension this does not need. */
+static size_t encode_into(char *out, size_t cap, const unsigned char *p, size_t n)
 {
-	size_t i;
+	size_t i, k = 0;
 
 	for (i = 0; i < n; i++) {
 		unsigned cp = (unsigned)byte_to_cp[p[i]];
+		if (k + 4 > cap) return 0;
 		if (cp < 0x80) {
-			fputc((int)cp, out);
+			out[k++] = (char)cp;
 		} else if (cp < 0x800) {
-			fputc((int)(0xC0 | (cp >> 6)), out);
-			fputc((int)(0x80 | (cp & 0x3F)), out);
+			out[k++] = (char)(0xC0 | (cp >> 6));
+			out[k++] = (char)(0x80 | (cp & 0x3F));
 		} else {
-			fputc((int)(0xE0 | (cp >> 12)), out);
-			fputc((int)(0x80 | ((cp >> 6) & 0x3F)), out);
-			fputc((int)(0x80 | (cp & 0x3F)), out);
+			out[k++] = (char)(0xE0 | (cp >> 12));
+			out[k++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+			out[k++] = (char)(0x80 | (cp & 0x3F));
 		}
 	}
+	out[k] = 0;
+	return k;
+}
+
+static void put_encoded(const unsigned char *p, size_t n, FILE *out)
+{
+	char buf[4096];
+
+	if (encode_into(buf, sizeof buf - 1, p, n))
+		fwrite(buf, 1, strlen(buf), out);
 }
 
 static void split_stdin(void)
@@ -615,17 +693,251 @@ static void split_stdin(void)
 	}
 }
 
+
+/* ------------------------------------------------------- lookup tables
+ *
+ * Two hash tables, both open addressed with linear probing and sized to
+ * twice the entry count so the load factor stays under a half. FNV-1a
+ * because the keys are short strings and the table is built once and
+ * then only read.
+ */
+typedef struct { const char *key; int val; } Slot;
+
+static Slot *vtab;        /* vocabulary entry -> id */
+static size_t vtab_mask;
+static Slot *mtab;        /* "left\x01right"  -> rank */
+static size_t mtab_mask;
+static char **mkeys;      /* the joined keys, owned here */
+
+static size_t fnv1a(const char *s)
+{
+	size_t h = 1469598103934665603ULL;
+
+	while (*s) {
+		h ^= (unsigned char)*s++;
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static void tab_put(Slot *t, size_t mask, const char *key, int val)
+{
+	size_t i = fnv1a(key) & mask;
+
+	while (t[i].key) {
+		if (!strcmp(t[i].key, key)) return;   /* first wins */
+		i = (i + 1) & mask;
+	}
+	t[i].key = key;
+	t[i].val = val;
+}
+
+static int tab_get(const Slot *t, size_t mask, const char *key, int *out)
+{
+	size_t i = fnv1a(key) & mask;
+
+	while (t[i].key) {
+		if (!strcmp(t[i].key, key)) { *out = t[i].val; return 1; }
+		i = (i + 1) & mask;
+	}
+	return 0;
+}
+
+static size_t pow2_at_least(size_t n)
+{
+	size_t p = 16;
+
+	while (p < n) p *= 2;
+	return p;
+}
+
+static void build_tables(void)
+{
+	size_t i, n;
+
+	n = pow2_at_least(vocab_n * 2);
+	vtab = calloc(n, sizeof *vtab);
+	if (!vtab) { fputs("bpec: out of memory\n", stderr); exit(1); }
+	vtab_mask = n - 1;
+	for (i = 0; i < vocab_n; i++)
+		tab_put(vtab, vtab_mask, vocab[i].tok, vocab[i].id);
+
+	n = pow2_at_least(merges_n * 2);
+	mtab = calloc(n, sizeof *mtab);
+	mkeys = calloc(merges_n, sizeof *mkeys);
+	if (!mtab || !mkeys) { fputs("bpec: out of memory\n", stderr); exit(1); }
+	mtab_mask = n - 1;
+	for (i = 0; i < merges_n; i++) {
+		size_t a = strlen(merges[i].left), b = strlen(merges[i].right);
+		char *k = malloc(a + b + 2);
+		if (!k) { fputs("bpec: out of memory\n", stderr); exit(1); }
+		memcpy(k, merges[i].left, a);
+		k[a] = 1;                       /* a separator no token contains */
+		memcpy(k + a + 1, merges[i].right, b);
+		k[a + b + 1] = 0;
+		mkeys[i] = k;
+		tab_put(mtab, mtab_mask, k, merges[i].rank);
+	}
+}
+
+/* --------------------------------------------------------- the merge loop
+ *
+ * A piece starts as its individual characters and the lowest-ranked
+ * adjacent pair is merged, repeatedly, until no pair has a rank. Rank
+ * is position in the merges list, so lower merges first, and the order
+ * is the whole algorithm: merging a higher-ranked pair first gives a
+ * different and wrong answer that still looks like tokenisation.
+ *
+ * Quadratic in the number of symbols per piece. Pieces are words, so
+ * the constant that matters is a handful of symbols, and a priority
+ * queue here would be more code than it saves.
+ * shortcut: O(n^2) per piece; upgrade to a linked list plus a heap of
+ * candidate pairs if a profile ever says a long piece dominates.
+ */
+#define MAX_SYM 4096
+
+static int merge_piece(const char *piece, int *ids, int cap)
+{
+	const char *sym[MAX_SYM];
+	int len[MAX_SYM];
+	char joined[1024];
+	int n = 0, i, count = 0;
+	size_t off = 0, plen = strlen(piece);
+
+	/* One symbol per codepoint, since the piece is byte-level encoded
+	 * and every merge is over those characters. */
+	while (off < plen && n < MAX_SYM) {
+		unsigned cp;
+		int l = utf8_next((const unsigned char *)piece + off, plen - off, &cp);
+		if (l == 0) l = 1;
+		sym[n] = piece + off;
+		len[n] = l;
+		n++;
+		off += (size_t)l;
+	}
+
+	for (;;) {
+		int best = -1, best_at = -1;
+
+		for (i = 0; i + 1 < n; i++) {
+			int rank;
+			size_t a = (size_t)len[i], b = (size_t)len[i + 1];
+			if (a + b + 2 > sizeof joined) continue;
+			memcpy(joined, sym[i], a);
+			joined[a] = 1;
+			memcpy(joined + a + 1, sym[i + 1], b);
+			joined[a + b + 1] = 0;
+			if (!tab_get(mtab, mtab_mask, joined, &rank)) continue;
+			if (best < 0 || rank < best) { best = rank; best_at = i; }
+		}
+		if (best_at < 0) break;
+
+		/* The two symbols are adjacent in the original buffer, so the
+		 * merged symbol is just the left one with a longer length. No
+		 * copying, and the result keeps pointing into `piece`. */
+		len[best_at] += len[best_at + 1];
+		for (i = best_at + 1; i + 1 < n; i++) {
+			sym[i] = sym[i + 1];
+			len[i] = len[i + 1];
+		}
+		n--;
+	}
+
+	for (i = 0; i < n && count < cap; i++) {
+		char tok[1024];
+		int id;
+		if ((size_t)len[i] + 1 > sizeof tok) return -1;
+		memcpy(tok, sym[i], (size_t)len[i]);
+		tok[len[i]] = 0;
+		if (!tab_get(vtab, vtab_mask, tok, &id)) {
+			/* Byte-level BPE puts all 256 single bytes in the
+			 * vocabulary, so every symbol reduces to something
+			 * present. A miss means the file and the algorithm
+			 * disagree, and guessing an id would be worse than
+			 * saying so. */
+			fprintf(stderr, "bpec: no id for symbol \"%s\"\n", tok);
+			return -1;
+		}
+		ids[count++] = id;
+	}
+	return count;
+}
+
+static int encode_stdin(void)
+{
+	static unsigned char buf[1 << 20];
+	static int ids[1 << 16];
+	size_t n = fread(buf, 1, sizeof buf, stdin), i = 0;
+
+	build_tables();
+	while (i < n) {
+		char piece[4096];
+		size_t a, seg;
+		size_t hit_at = n, hit_len = 0;
+		int hit_id = -1;
+
+		/* The input is SPLIT on added tokens, not probed at piece
+		 * boundaries. Probing at boundaries was the first version
+		 * and it missed every token that does not start one: in
+		 * "\"<|endoftext|>\"" the punctuation run matches "\"<|" and
+		 * steps straight over the start, so the token tokenised as
+		 * ordinary text. Three corpus inputs caught it.
+		 *
+		 * Earliest match wins, and the longest at that position, so
+		 * two added tokens sharing a prefix cannot have the shorter
+		 * swallow the longer. */
+		for (seg = i; seg < n && hit_id < 0; seg++) {
+			for (a = 0; a < added_n; a++) {
+				size_t l = strlen(added[a].content);
+				if (n - seg < l || memcmp(buf + seg, added[a].content, l))
+					continue;
+				if (l > hit_len) { hit_at = seg; hit_len = l; hit_id = added[a].id; }
+			}
+		}
+
+		/* Nothing of the added token is in this segment, so the
+		 * ordinary path runs up to where it starts. */
+		if (hit_id >= 0 && hit_at == i) {
+			printf("%d\n", hit_id);
+			i += hit_len;
+			continue;
+		}
+		{
+		/* Stop the ordinary path where the added token begins. */
+		size_t limit = (hit_id >= 0) ? hit_at : n;
+		size_t plen = next_piece(buf + i, limit - i);
+		int got, k;
+
+		if (!encode_into(piece, sizeof piece - 1, buf + i, plen)) {
+			fputs("bpec: a piece is too long to encode\n", stderr);
+			return 1;
+		}
+
+		got = merge_piece(piece, ids, (int)(sizeof ids / sizeof *ids));
+		if (got < 0) return 1;
+		for (k = 0; k < got; k++) printf("%d\n", ids[k]);
+		i += plen;
+		}
+	}
+	return 0;
+}
+
 static void usage(void)
 {
 	fputs("usage: bpec --alphabet\n"
 	      "       bpec --load TOKENIZER_JSON\n"
-	      "       bpec --split   (text on stdin, one piece per line)\n", stderr);
+	      "       bpec --split   (text on stdin, one piece per line)\n"
+	      "       bpec --encode TOKENIZER_JSON   (text on stdin, one id per line)\n", stderr);
 }
 
 int main(int argc, char **argv)
 {
 	build_byte_map();
 
+	if (argc == 3 && !strcmp(argv[1], "--encode")) {
+		if (!load_tokenizer(argv[2])) return 1;
+		return encode_stdin();
+	}
 	if (argc == 3 && !strcmp(argv[1], "--load")) {
 		if (!load_tokenizer(argv[2])) return 1;
 		printf("vocab %zu\nmerges %zu\n", vocab_n, merges_n);
