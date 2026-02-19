@@ -13,7 +13,8 @@ $ printf 'hello world' | ./bpec --encode tokenizer.json
 995
 ```
 
-`make test`: **18 passed, 0 failed.**
+`make test`: **19 passed, 0 failed.** `make test-asan`: the same under
+ASan and UBSan.
 
 ## Why exactness and not "close"
 
@@ -62,7 +63,7 @@ class boundaries. Uniform random Unicode would have been almost
 entirely unassigned and would have tested nothing while looking
 thorough.
 
-The ids themselves. 3789 of 3789 inputs identical, 64848 tokens
+The ids themselves. 4049 of 4049 inputs identical, 68640 tokens
 compared, against the fixed traps, the random strings, and every line
 of this repository's own C, Markdown, shell and Python. Real text is
 where the merge table is exercised, because random strings rarely
@@ -100,6 +101,42 @@ that position.
 
 Three corpus inputs caught it and not one of the hand-written cases
 did, because every one of those had put the token after a letter.
+
+## Hostile input, where the oracle runs out
+
+Byte-level BPE is defined for all 256 byte values, so there is no input
+bpec may refuse: text that is not valid UTF-8 still has to tokenise,
+which is the reason models use byte level at all.
+
+The library cannot be the oracle for that half, because it takes `str`
+and cannot be handed bytes that are not text. So 158 of the 299 cases
+are held to what is true regardless: it terminates, exits 0, emits ids
+inside the vocabulary, and gives the same answer twice. The other 141
+are valid UTF-8 and are still compared against the reference. Splitting
+the corpus that way rather than skipping the invalid half is the
+difference between testing this and claiming to.
+
+That sweep found four defects, and two of them are the same shape: a
+wrong answer that looks like a right one.
+
+A 1 MB static input buffer silently truncated anything larger. 1.2 MB
+of input produced 524289 ids and looked like a clean run, because every
+id it did emit was correct. `merge_piece` capped at 4096 symbols and
+dropped the rest of a longer piece the same way. Both read the whole
+input now.
+
+A 4096-byte piece buffer refused a 5000-character word that the
+reference tokenises without complaint. Sized from the piece now.
+
+And the added-token scan restarted at every piece and ran to the end of
+input, making encoding quadratic in the input size: 1.2 MB of ordinary
+words never finished. It is cached, and that input takes 0.1 seconds.
+
+`make test-asan` was added for this and found a real 1.3 MB leak on its
+first run: the tokenizer file was read into a local buffer and never
+freed, though every string is copied out of it. The remaining
+allocations live in globals and are still reachable at exit, which is a
+choice rather than a leak.
 
 ## What does not work
 
