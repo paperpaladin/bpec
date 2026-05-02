@@ -219,9 +219,39 @@ repeatedly.
 - [ ] 09 decode, and the round trip
       why: last of the features, and weakest as an oracle, so it comes
            after the ones that can actually catch something.
-- [ ] 10 a second tokenizer file from a different model family
-      why: one vocabulary is one data point. A Llama tokenizer uses the
+- [x] 10 a second tokenizer file from a different model family
+      why: one vocabulary is one data point. A second file uses the
            same machinery with different merges and would catch
            anything hard-coded to GPT-2.
+      done: roberta-base, pinned by sha256 like the first. 4269 inputs
+           identical, 72388 tokens, first run, no mismatch: nothing was
+           hard-coded to GPT-2 after all, which is the answer this item
+           existed to get rather than the one it expected.
+           It was not free. RoBERTa's <mask> sets lstrip, which no
+           GPT-2 file sets, so the file was refused outright until the
+           flag was implemented. lstrip makes an added token absorb the
+           whitespace in front of it: "a  <mask>" is "a" and "  <mask>",
+           not "a", two spaces, and the token.
+           Three candidates were rejected before this one and the
+           reasons are the gaps. gpt-neox-20b and Qwen2 both carry an
+           NFC normalizer, which is refused by name; Qwen additionally
+           uses a Sequence pre-tokenizer with its own regex. So the
+           second family shares GPT-2's pre-tokenizer, and a tokenizer
+           with a different one is still untested.
+           RoBERTa has a post-processor that wraps output in <s> and
+           </s>. Every comparison passes add_special_tokens=False and
+           the README names post-processing as out of scope, because
+           comparing against it would be grading this on a feature it
+           says it does not have.
+           rstrip, lstrip's mirror, is set by no real file here, so the
+           code for it would have been untested. The oracle reads a
+           file we construct, so the file is constructed: the real
+           RoBERTa vocabulary with rstrip added to <s>, and the library
+           answers for it. That is what caught the two mutations that
+           survived without it, one of them a real bug: the backward
+           scan has to stop at the start of the segment, because in
+           "a<s>  <mask>b" the rstrip token takes both spaces and the
+           lstrip token must not take them a second time.
+           Seven mutations, all caught.
 - [ ] 11 README with the measured agreement rate and what does not work
       why: last, so the numbers in it are the numbers the suite prints.

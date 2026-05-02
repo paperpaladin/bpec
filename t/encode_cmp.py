@@ -30,6 +30,12 @@ from pathlib import Path
 
 from tokenizers import Tokenizer
 
+# add_special_tokens=False because post-processing is a separate stage
+# and bpec does not implement it. RobertaProcessing wraps output in <s>
+# and </s>; comparing against that would be testing a feature this
+# program says it does not have. GPT-2's post-processor adds nothing,
+# so the flag changes none of its answers.
+
 FIXED = [
     "hello world", "don't stop", "  two  spaces ", "x1 23 456", "tab\there",
     "Hello, World!", "日本 語", "a  \n b", "", " ", "   ", "\n\n\n",
@@ -84,7 +90,7 @@ def main():
     cases = FIXED + random_inputs(count, seed=11) + own_source()
     bad = tokens = 0
     for text in cases:
-        want = tok.encode(text).ids
+        want = tok.encode(text, add_special_tokens=False).ids
         res = subprocess.run([binary, "--encode", tokfile],
                              input=text.encode("utf-8"), capture_output=True)
         got = [int(x) for x in res.stdout.split()]

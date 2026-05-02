@@ -12,6 +12,13 @@ cd "$(dirname "$0")/.."
 TOK_URL=https://huggingface.co/gpt2/raw/main/tokenizer.json
 TOK_SHA=8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6
 TOK=scratch/gpt2-tokenizer.json
+# A second family, because one tokenizer file is one data point. RoBERTa
+# shares byte-level BPE with GPT-2 and differs where it matters: a
+# different vocabulary, five added tokens instead of one, and <mask>
+# with lstrip set, which no GPT-2 file exercises.
+TOK2_URL=https://huggingface.co/roberta-base/raw/main/tokenizer.json
+TOK2_SHA=847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e
+TOK2=scratch/roberta-tokenizer.json
 VENV=scratch/venv
 LIB_VERSION=0.23.3
 : "${BPEC:=./bpec}"
@@ -29,23 +36,30 @@ eq()   { if [ "$2" = "$3" ]; then ok "$1"; else nok "$1" "want [$2] got [$3]"; f
 mkdir -p scratch
 
 # ---------------------------------------------------------- the tokenizer
-if [ ! -f "$TOK" ]; then
-	command -v curl >/dev/null 2>&1 || {
-		echo "SKIP: curl is not installed, so the oracle cannot be fetched"
-		exit 0; }
-	curl -sSL --max-time 180 -o "$TOK.part" "$TOK_URL" 2>/dev/null || {
-		rm -f "$TOK.part"
-		echo "SKIP: cannot reach huggingface.co, so there is no oracle to check against"
-		exit 0; }
-	mv "$TOK.part" "$TOK"
-fi
-got=$(sha256sum "$TOK" | cut -d' ' -f1)
-if [ "$got" != "$TOK_SHA" ]; then
-	echo "FAIL: tokenizer.json sha256 is $got, expected $TOK_SHA" >&2
-	echo "  the pin exists so a result cannot shift under a changed vocabulary." >&2
-	rm -f "$TOK"
-	exit 1
-fi
+# Returns 1 if the file could not be fetched, so a caller can decide
+# whether that is a skip or the end of the run. A sha mismatch is
+# neither: the pin exists so a result cannot shift under a changed
+# vocabulary, and a changed vocabulary has to be looked at by a person.
+fetch_tok() { # path, url, sha
+	if [ ! -f "$1" ]; then
+		command -v curl >/dev/null 2>&1 || return 1
+		curl -sSL --max-time 180 -o "$1.part" "$2" 2>/dev/null || {
+			rm -f "$1.part"; return 1; }
+		mv "$1.part" "$1"
+	fi
+	got=$(sha256sum "$1" | cut -d' ' -f1)
+	if [ "$got" != "$3" ]; then
+		echo "FAIL: $1 sha256 is $got, expected $3" >&2
+		echo "  the pin exists so a result cannot shift under a changed vocabulary." >&2
+		rm -f "$1"
+		exit 1
+	fi
+	return 0
+}
+
+fetch_tok "$TOK" "$TOK_URL" "$TOK_SHA" || {
+	echo "SKIP: cannot fetch $TOK_URL, so there is no oracle to check against"
+	exit 0; }
 
 # ---------------------------------------------------------- the library
 if [ ! -x "$VENV/bin/python" ]; then
@@ -213,6 +227,91 @@ if [ -x "$BPEC" ]; then
 		nok "$line"
 		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
 	fi
+fi
+
+# ------------------------------------------- a second tokenizer family
+# Everything above is GPT-2, which is one vocabulary and therefore one
+# data point. RoBERTa is the same byte-level BPE over a different
+# vocabulary, with five added tokens instead of one, and <mask> sets
+# lstrip, which no GPT-2 file exercises.
+#
+# Its post-processor wraps output in <s> and </s>. That is a separate
+# stage bpec does not implement, so every comparison here passes
+# add_special_tokens=False and the README says post-processing is out
+# of scope. Comparing against it would be grading this program on a
+# feature it says it does not have.
+if [ -x "$BPEC" ] && fetch_tok "$TOK2" "$TOK2_URL" "$TOK2_SHA"; then
+	want_v=$("$VENV/bin/python" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["model"]["vocab"]))' "$TOK2")
+	want_m=$("$VENV/bin/python" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["model"]["merges"]))' "$TOK2")
+	got=$("$BPEC" --load "$TOK2")
+	eq "the second family's vocabulary size is its file's" \
+	   "vocab $want_v" "$(echo "$got" | sed -n 1p)"
+	eq "the second family's merge count is its file's" \
+	   "merges $want_m" "$(echo "$got" | sed -n 2p)"
+
+	# lstrip makes the added-token match absorb the whitespace in front
+	# of it, so "a  <mask>" is "a" and "  <mask>" rather than "a", two
+	# spaces, and the token. <s> does not set it and is the control:
+	# its space stays a separate token. Named separately from the
+	# corpus run so a failure says lstrip and not "ids differ".
+	for t in "a <mask>" "a  <mask> b" "a<mask>b" "<mask>" " <mask>" \
+	         "a <s> b" " <s>" "a\t\n<mask>"; do
+		hex=$(printf '%b' "$t" | od -An -tx1 | tr -d ' \n')
+		want=$(printf '%s\n' "$hex" | "$VENV/bin/python" t/oracle.py "$TOK2")
+		ours=$(printf '%b' "$t" | "$BPEC" --encode "$TOK2" | tr '\n' ' ' | sed 's/ $//')
+		eq "lstrip: [$t]" "$want" "$ours"
+	done
+
+	# rstrip is the mirror of lstrip and no real file here sets it, so
+	# the code for it would be untested against anything. The oracle
+	# will read a file we construct, so the file is constructed: the
+	# real RoBERTa vocabulary with rstrip added to <s>. The library
+	# honours the flag and answers for it, which makes this a
+	# comparison and not an assertion about what we believe.
+	#
+	# "a<s>  <mask>b" is the case that matters, and it is why the
+	# backward scan stops at the start of the segment rather than at
+	# the start of the input: <s> takes both spaces, and <mask> must
+	# not take them a second time.
+	"$VENV/bin/python" -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+for a in d['added_tokens']:
+    if a['content'] == '<s>':
+        a['rstrip'] = True
+json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
+" "$TOK2" scratch/roberta-rstrip.json
+	for t in "a<s>  b" "a<s>  <mask>b" "a <s>  <mask> b" "<s>   " "a<s>b"; do
+		hex=$(printf '%b' "$t" | od -An -tx1 | tr -d ' \n')
+		want=$(printf '%s\n' "$hex" |
+		       "$VENV/bin/python" t/oracle.py scratch/roberta-rstrip.json)
+		ours=$(printf '%b' "$t" |
+		       "$BPEC" --encode scratch/roberta-rstrip.json |
+		       tr '\n' ' ' | sed 's/ $//')
+		eq "rstrip: [$t]" "$want" "$ours"
+	done
+
+	out=$("$VENV/bin/python" t/encode_cmp.py "$BPEC" "$TOK2" "$BPEC_RANDOM" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "second family, $line"
+	else
+		nok "second family, $line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+
+	out=$("$VENV/bin/python" t/hostile.py "$BPEC" "$TOK2" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "second family, $line"
+	else
+		nok "second family, $line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+elif [ -x "$BPEC" ]; then
+	skip "the second tokenizer family could not be fetched"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
