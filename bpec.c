@@ -54,6 +54,26 @@ static void build_byte_map(void)
 			byte_to_cp[b] = next++;
 }
 
+/* The inverse, derived from the forward map rather than written out a
+ * second time. A hand-written inverse is a second place for the same
+ * fact to be wrong, and the two would disagree only for the 68 bytes
+ * that do not stand for themselves, which is exactly the half nobody
+ * checks by eye.
+ */
+#define CP_MAX 0x200
+static int cp_to_byte[CP_MAX];
+
+static void build_cp_map(void)
+{
+	int b, c;
+
+	for (c = 0; c < CP_MAX; c++) cp_to_byte[c] = -1;
+	for (b = 0; b < BYTE_ALPHABET; b++) {
+		c = byte_to_cp[b];
+		if (c >= 0 && c < CP_MAX) cp_to_byte[c] = b;
+	}
+}
+
 /* The alphabet is the set of codepoints the map produces, which is the
  * thing the library exposes and so the thing that can be compared whole
  * rather than sampled. Printed one per line, unsorted: the harness
@@ -795,6 +815,113 @@ static void build_tables(void)
 	}
 }
 
+/* ------------------------------------------------------------- decode
+ *
+ * The reverse of encode: ids to vocabulary entries, concatenated, then
+ * each codepoint of the result mapped back to the byte it stands for.
+ *
+ * The output is bytes and not text, and that is the whole reason this
+ * is worth implementing carefully. A token boundary can fall in the
+ * middle of a UTF-8 sequence, so a decoder that tried to produce a
+ * string one token at a time would have to decide what to do with
+ * half a character. Byte level has no such problem: the concatenation
+ * happens first and the bytes come out whatever they are. The library
+ * does the same thing and then replaces what is not valid UTF-8,
+ * which is why the comparison in t/decode_cmp.py is against its
+ * bytes and not its str.
+ */
+static char **id_to_tok;    /* owned by vocab and added, not copied */
+static int id_max;
+
+static void build_decode_table(void)
+{
+	size_t i;
+
+	id_max = -1;
+	for (i = 0; i < vocab_n; i++)
+		if (vocab[i].id > id_max) id_max = vocab[i].id;
+	for (i = 0; i < added_n; i++)
+		if (added[i].id > id_max) id_max = added[i].id;
+	if (id_max < 0) return;
+
+	id_to_tok = calloc((size_t)id_max + 1, sizeof *id_to_tok);
+	if (!id_to_tok) { fputs("bpec: out of memory\n", stderr); exit(1); }
+	for (i = 0; i < vocab_n; i++)
+		id_to_tok[vocab[i].id] = vocab[i].tok;
+	/* After the vocabulary, because an added token with an id the
+	 * vocabulary also uses is the added token: that is what makes it
+	 * added. GPT-2 has no such collision and RoBERTa does not either,
+	 * so this ordering is untested and says so here rather than
+	 * looking deliberate in a diff. */
+	for (i = 0; i < added_n; i++)
+		id_to_tok[added[i].id] = added[i].content;
+}
+
+static int decode_stdin(void)
+{
+	char line[64];
+	unsigned char *out = NULL;
+	size_t n = 0, cap = 0;
+	int rc = 0;
+
+	build_decode_table();
+
+	while (fgets(line, sizeof line, stdin)) {
+		char *end;
+		long id;
+
+		if (line[0] == '\n' || line[0] == 0) continue;
+		id = strtol(line, &end, 10);
+		while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')
+			end++;
+		if (*end || end == line) {
+			fprintf(stderr, "bpec: \"%s\" is not a token id\n", line);
+			rc = 1;
+			goto done;
+		}
+		if (id < 0 || id > id_max || !id_to_tok[id]) {
+			fprintf(stderr, "bpec: %ld is not in this vocabulary\n", id);
+			rc = 1;
+			goto done;
+		}
+
+		const unsigned char *t = (const unsigned char *)id_to_tok[id];
+		size_t tn = strlen((const char *)t), j = 0;
+		while (j < tn) {
+			unsigned cp;
+			int len = utf8_next(t + j, tn - j, &cp);
+			if (len == 0) {
+				fprintf(stderr, "bpec: vocabulary entry for %ld is not "
+				        "valid UTF-8\n", id);
+				rc = 1;
+				goto done;
+			}
+			j += (size_t)len;
+			if (cp >= CP_MAX || cp_to_byte[cp] < 0) {
+				fprintf(stderr, "bpec: vocabulary entry for %ld contains "
+				        "U+%04X, which is not in the byte alphabet\n",
+				        id, cp);
+				rc = 1;
+				goto done;
+			}
+			if (n == cap) {
+				cap = cap ? cap * 2 : 4096;
+				out = realloc(out, cap);
+				if (!out) { fputs("bpec: out of memory\n", stderr); rc = 1; goto done; }
+			}
+			out[n++] = (unsigned char)cp_to_byte[cp];
+		}
+	}
+
+	if (n && fwrite(out, 1, n, stdout) != n) {
+		fputs("bpec: short write\n", stderr);
+		rc = 1;
+	}
+done:
+	free(out);
+	return rc;
+}
+
 /* --------------------------------------------------------- the merge loop
  *
  * A piece starts as its individual characters and the lowest-ranked
@@ -1019,16 +1146,22 @@ static void usage(void)
 	fputs("usage: bpec --alphabet\n"
 	      "       bpec --load TOKENIZER_JSON\n"
 	      "       bpec --split   (text on stdin, one piece per line)\n"
-	      "       bpec --encode TOKENIZER_JSON   (text on stdin, one id per line)\n", stderr);
+	      "       bpec --encode TOKENIZER_JSON   (text on stdin, one id per line)\n"
+	      "       bpec --decode TOKENIZER_JSON   (ids on stdin, bytes out)\n", stderr);
 }
 
 int main(int argc, char **argv)
 {
 	build_byte_map();
+	build_cp_map();
 
 	if (argc == 3 && !strcmp(argv[1], "--encode")) {
 		if (!load_tokenizer(argv[2])) return 1;
 		return encode_stdin();
+	}
+	if (argc == 3 && !strcmp(argv[1], "--decode")) {
+		if (!load_tokenizer(argv[2])) return 1;
+		return decode_stdin();
 	}
 	if (argc == 3 && !strcmp(argv[1], "--load")) {
 		if (!load_tokenizer(argv[2])) return 1;
