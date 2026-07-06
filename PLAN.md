@@ -173,10 +173,29 @@ repeatedly.
       note: lstrip, rstrip and single_word are refused by name. Each
             changes which text the token matches, and GPT-2 sets all
             three false.
-- [ ] 07 a corpus sweep: every line of a few megabytes of real text,
+- [x] 07 a corpus sweep: every line of a few megabytes of real text,
       ids compared
       why: the number this project lives or dies by. Millions of
            comparisons, not dozens.
+      done: 4017774 bytes of the Python standard library as installed
+           here, 144 files, 1824803 tokens, identical for both
+           tokenizer families on the first run. Not vendored and not
+           downloaded: the corpus is whatever large body of real text
+           the machine already has, and the suite reports what it
+           swept rather than asserting a number that would differ on
+           another machine. It skips loudly when there is nothing
+           large to read, and also when the budget is there but the
+           bytes are not, because a sweep that swept almost nothing
+           would otherwise report success.
+           Compared per file rather than per line: a line is one
+           subprocess and four megabytes is a hundred thousand of
+           them. A mismatch bisects to the smallest failing line, so
+           a failure still names something a person can read instead
+           of "somewhere in 4 MB". Checked by planting a merge-rank
+           defect, which named the exact line and both id sequences.
+           13 seconds per family, so it is cheap enough to run every
+           time. The ASan target sweeps a tenth, since a sanitizer
+           costs twenty times per run.
 - [x] 08 a hostile-input sweep: lone surrogates, truncated UTF-8, NUL,
       very long runs, every byte 0 to 255
       why: input is untrusted text and the byte-level mapping is

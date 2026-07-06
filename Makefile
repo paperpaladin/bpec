@@ -15,7 +15,7 @@ test-asan:
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 	      -fno-omit-frame-pointer -ffile-prefix-map=$(CURDIR)=. \
 	      -o bpec-asan bpec.c
-	@BPEC=./bpec-asan BPEC_RANDOM=200 t/run.sh
+	@BPEC=./bpec-asan BPEC_RANDOM=200 BPEC_CORPUS_BYTES=400000 t/run.sh
 
 clean:
 	rm -f bpec bpec-asan
