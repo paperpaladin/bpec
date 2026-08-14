@@ -38,7 +38,8 @@ nok()  { fail=$((fail + 1)); printf 'FAIL  %s\n' "$1"
 skip() { printf 'SKIP  %s\n' "$1"; }
 eq()   { if [ "$2" = "$3" ]; then ok "$1"; else nok "$1" "want [$2] got [$3]"; fi; }
 
-mkdir -p scratch
+mkdir -p scratch scratch/bad
+TMP_SAN=scratch/sanprobe.$$.c
 
 # ---------------------------------------------------------- the tokenizer
 # Returns 1 if the file could not be fetched, so a caller can decide
@@ -213,6 +214,45 @@ if [ -x "$BPEC" ]; then
 		nok "$line"
 		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
 	fi
+fi
+
+# ----------------------------------- the sanitizer can actually see
+# A buffer larger than the data makes ASan useless for the one class
+# of bug it is most wanted for. The input buffer doubles, so after
+# reading 1 KB it is 64 KB, and a read one byte past the end of the
+# input lands 63 KB inside a live allocation. Nothing is reported.
+#
+# This is not hypothetical and it is not a guess. Built both ways
+# below with a deliberate one-past-the-end read planted: untrimmed,
+# ASan reports nothing at all; trimmed, it reports the overflow. An
+# hour-long clean ASan run was blind to the whole class before the
+# trim went in.
+#
+# A sibling repository found the same thing independently, where
+# deleting a bounds check produced 33 wrong answers and zero
+# sanitizer reports.
+if command -v gcc >/dev/null 2>&1; then
+	"$VENV/bin/python" - bpec.c "$TMP_SAN" <<'PLANT' 2>/dev/null || true
+import sys
+lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
+idx = max(k for k, l in enumerate(lines) if l == "\twhile (i < n) {")
+lines.insert(idx, "\tif (n) { volatile unsigned char probe = buf[n]; (void)probe; }")
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
+PLANT
+	if [ -s "$TMP_SAN" ] && gcc -std=c11 -g -O1 -w -fsanitize=address \
+	     -fno-omit-frame-pointer -I. -o "$TMP_SAN.bin" "$TMP_SAN" 2>/dev/null; then
+		hits=$(printf 'hello' | "$TMP_SAN.bin" --encode "$TOK" 2>&1 |
+		       grep -c 'heap-buffer-overflow' || true)
+		if [ "$hits" -gt 0 ]; then
+			ok "a read one byte past the input is visible to ASan"
+		else
+			nok "a read one byte past the input is visible to ASan" \
+			    "ASan reported nothing, so the input buffer is larger than the input again"
+		fi
+	else
+		echo "SKIP  could not build the sanitizer probe"
+	fi
+	rm -f "$TMP_SAN" "$TMP_SAN.bin"
 fi
 
 # ------------------------------------------------ megabytes of real text
