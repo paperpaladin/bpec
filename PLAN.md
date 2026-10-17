@@ -100,10 +100,43 @@ repeatedly.
             wrong corrupts exactly the non-ASCII vocabulary entries
             byte-level BPE depends on, silently. Item 10 will force
             them.
-- [ ] 04 the GPT-2 pre-tokenizer regex, against the library's split
+- [x] 04 the GPT-2 pre-tokenizer regex, against the library's split
       why: this is where exactness is lost. The pattern needs Unicode
            letter and number classes, and `\s+(?!\S)` needs lookahead.
            Compared split by split before any merging happens.
+      files: bpec.c classes.h tools/gen_classes.py t/split_cmp.py t/run.sh
+      proves: 2045 of 2045 inputs split identically to the library, 45
+              fixed cases plus 2000 random strings drawn from codepoint
+              ranges chosen to straddle class boundaries. Uniform random
+              Unicode would have been almost entirely unassigned and
+              would have tested nothing.
+      found: the lookahead in `\s+(?!\S)` backtracks by one CHARACTER
+             and the first version backtracked by one BYTE, so a
+             multi-byte space was cut in half: U+00A0 came out as two
+             pieces where the reference gives one, and U+2003 the same.
+             Found by the corpus. Reading the code would not have shown
+             it, because the code looked right for every ASCII space.
+      note: hand-written scanner, not a regex engine. The pattern is
+            fixed and five of its six alternatives are a character
+            class and a plus, so a scanner is smaller and has no
+            lookahead machinery to get wrong. It also cannot borrow
+            `rx` from this collection, since no suite here may depend
+            on a sibling repository.
+      note: the three character classes are generated from Python's
+            unicodedata, 807 ranges, never typed. The reference gets
+            its tables from the Rust regex crate, which tracks its own
+            Unicode version, so the two could disagree on codepoints
+            assigned between versions. 2045 inputs have not found such
+            a disagreement; that is evidence and not proof, and the
+            generated header says so.
+      note: one equivalent mutant. Swapping ` ?\p{L}+` and ` ?\p{N}+`
+            in the alternation changes nothing, because after the
+            optional space the next character is either a letter or a
+            number and never both, so the two alternatives are
+            disjoint. Recorded rather than treated as a gap in the
+            test. Two other mutants are caught: dropping the `'ll`
+            contraction, and keeping the whole whitespace run instead
+            of backtracking.
 - [ ] 05 the BPE merge loop, rank-ordered
       why: the core, and meaningless without 04 feeding it the right
            pieces.
