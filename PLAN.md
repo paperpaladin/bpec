@@ -72,11 +72,34 @@ repeatedly.
             0x100 upward in byte order. A 256-entry table written by
             hand is 256 chances to be wrong in a way that shows up on
             one input in a million.
-- [ ] 03 read tokenizer.json: vocab and merges, with a refusal for every
+- [x] 03 read tokenizer.json: vocab and merges, with a refusal for every
       field we do not implement
       why: the file is the input and most of the ways this goes wrong
            are in reading it. A normalizer or an unsupported model type
            must be refused by name.
+      proves: 50257 vocabulary entries and 50000 merges, both counts
+              taken from the file by the library and by us
+              independently. Seven refusals, each a real tokenizer file
+              with one field changed, each required to name the field
+              it is refusing: normalizer, model type, dropout,
+              unk_token, end_of_word_suffix, pre_tokenizer type, and a
+              file written with \u escapes.
+      found: two bugs in this commit's own code, both found by the
+             refusal tests rather than by reading.
+             A refusal did not refuse. "type" comes after vocab and
+             merges in a real file, so by the time WordPiece was
+             rejected the vocabulary had loaded, and the only gate was
+             "did we get a vocabulary", so load_tokenizer returned
+             SUCCESS while printing "only BPE is implemented" directly
+             above it.
+             And an error with no message. A Json error inside
+             load_model had its text in j.err, and the caller returned
+             before printing it, so every malformed file came out as
+             exit 1 and total silence.
+      note: \u escapes are refused rather than decoded. Getting them
+            wrong corrupts exactly the non-ASCII vocabulary entries
+            byte-level BPE depends on, silently. Item 10 will force
+            them.
 - [ ] 04 the GPT-2 pre-tokenizer regex, against the library's split
       why: this is where exactness is lost. The pattern needs Unicode
            letter and number classes, and `\s+(?!\S)` needs lookahead.
