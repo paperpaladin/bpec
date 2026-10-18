@@ -106,4 +106,9 @@ def main():
     return 1 if bad else 0
 
 
-sys.exit(main())
+# Guarded because t/decode_cmp.py imports the corpus from here rather
+# than keeping a second copy of it. Without this, importing the module
+# runs the whole encode comparison as a side effect, which is a
+# confusing twenty seconds and a duplicate summary line.
+if __name__ == "__main__":
+    sys.exit(main())

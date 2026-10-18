@@ -13,8 +13,11 @@ $ printf 'hello world' | ./bpec --encode tokenizer.json
 995
 ```
 
-`make test`: **36 passed, 0 failed.** `make test-asan`: the same under
-ASan and UBSan.
+`make test`: **43 passed, 0 failed.** `make test-asan`: the same under
+ASan and UBSan, clean, and it takes about an hour. The corpus is
+thousands of separate runs and each one loads a 50257-entry
+vocabulary; under a sanitizer that is twenty times slower. It is slow
+rather than hung.
 
 ## Why exactness and not "close"
 
@@ -186,9 +189,66 @@ freed, though every string is copied out of it. The remaining
 allocations live in globals and are still reachable at exit, which is a
 choice rather than a leak.
 
+## Decode, and where encode stops being invertible
+
+Ids back to bytes: vocabulary entries concatenated, then each
+codepoint mapped back to the byte it stands for. The inverse of the
+byte map is derived from the forward one rather than written out
+again, because a hand-written inverse is a second place for the same
+fact to be wrong and the two would disagree only for the 68 bytes
+that do not stand for themselves, which is the half nobody checks by
+eye.
+
+4297 decodes against the library per tokenizer, and the ids come from
+the library rather than from us, so this is the decoder on its own
+rather than encode and decode together with two matching mistakes
+cancelling.
+
+The expected text is `decode(ids, skip_special_tokens=False)` and not
+the original input, and finding out why took fourteen failures.
+**Encode is not invertible when an added token sets `lstrip`.**
+`"a<s>  <mask>b"` has its two spaces absorbed into the `<mask>`
+match, and the token carries no spaces, so nothing can put them
+back. The library returns `"a<s><mask>b"` and so do we. The fourteen
+failures were the tokenizer working as designed and the test
+measuring the wrong thing.
+
+The round trip is the other half and it runs on bytes the library
+cannot be asked about: 264 cases including every one of the 256 byte
+values alone, truncated UTF-8, lone surrogates and NUL. Byte-level
+BPE is lossless by construction, so encode then decode has to return
+the original bytes exactly, and that is the property that would catch
+a decoder quietly dropping one.
+
+Four refusals: an id past the end of the vocabulary, an id inside it
+with no entry, a negative id, and a line that is not a number.
+Decoding any of those to nothing, or to a replacement character,
+would turn a corrupt id stream into plausible text.
+
+One more refusal needs a constructed file, because no real tokenizer
+reaches it: a vocabulary entry containing a codepoint the byte
+alphabet never produces. Worth keeping rather than deleting, because
+dropping the bounds check in front of it turns the guard into an
+out-of-bounds read, and the test catches that as a crash with no
+message rather than as a wrong answer.
+
+## A survivor, written down
+
+Removing the added-token pass from the decode table changes nothing,
+and it is not an untested branch: every added token in both files is
+also a vocabulary entry at the same id. `<|endoftext|>` is 50256 in
+GPT-2's vocabulary as well as in its added tokens, and all five of
+RoBERTa's are the same. The pass is kept because a file where they
+differ is allowed by the format, and it is ordered after the
+vocabulary because an added token that collides with one is the
+added token. Neither file exercises that, which is why this
+paragraph exists instead of a test.
+
 ## What does not work
 
-- Decoding, and the round trip. Item 09.
+- `skip_special_tokens`, the library's default on decode, which
+  deletes added tokens from the output entirely. That is a different
+  operation and this does not implement it.
 - `\u` escapes in a tokenizer file are refused rather than decoded.
   Decoding them wrongly corrupts exactly the non-ASCII vocabulary
   entries byte-level BPE depends on, and silently. Neither file here

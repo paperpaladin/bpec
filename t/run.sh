@@ -210,7 +210,75 @@ if [ -x "$BPEC" ]; then
 	fi
 fi
 
-# ------------------------------------------------------- hostile input
+# ---------------------------------------------------------- decode
+# The ids come from the library and so does the expected text, so
+# this tests the decoder on its own rather than testing encode and
+# decode together and letting two matching mistakes cancel.
+#
+# The expected text is decode(ids, skip_special_tokens=False) and not
+# the original input. Encode is not invertible when an added token
+# sets lstrip: "a<s>  <mask>b" has its two spaces absorbed into the
+# <mask> match and the token carries no spaces, so nothing can put
+# them back. The library answers "a<s><mask>b" and so do we.
+# Comparing against the input instead reported fourteen failures that
+# were the tokenizer working as designed.
+if [ -x "$BPEC" ]; then
+	out=$("$VENV/bin/python" t/decode_cmp.py "$BPEC" "$TOK" "$BPEC_RANDOM" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "$line"
+	else
+		nok "$line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+
+	# An id the vocabulary does not have is refused. Emitting nothing
+	# for it, or a replacement character, would turn a corrupt id
+	# stream into plausible-looking text.
+	for bad in 99999 50257 -1 "not-a-number"; do
+		out=$(printf '%s\n' "$bad" | "$BPEC" --decode "$TOK" 2>&1 >/dev/null)
+		if [ $? -eq 0 ]; then
+			nok "refuses [$bad] as a token id" "it was accepted"
+		elif [ -z "$out" ]; then
+			nok "refuses [$bad] as a token id" "it failed without saying why"
+		else
+			ok "refuses [$bad] as a token id"
+		fi
+	done
+
+	# A vocabulary entry holding a codepoint the byte alphabet never
+	# produces. Unreachable with any real file, so a mutation that
+	# deletes the guard survives; the file is constructed instead.
+	# Decoding it to a replacement character, or to nothing, would
+	# turn a corrupt vocabulary into plausible text.
+	"$VENV/bin/python" -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+v = d['model']['vocab']
+victim = [k for k, i in v.items() if i == 500][0]
+del v[victim]
+v['\u03a9x'] = 500
+json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
+" "$TOK" scratch/bad/outside.json
+	out=$(printf '500\n' | "$BPEC" --decode scratch/bad/outside.json 2>&1 >/dev/null)
+	if [ $? -eq 0 ]; then
+		nok "refuses a vocabulary entry outside the byte alphabet" "it was accepted"
+	elif printf '%s' "$out" | grep -q 'not in the byte alphabet'; then
+		ok "refuses a vocabulary entry outside the byte alphabet, by name"
+	else
+		nok "refuses a vocabulary entry outside the byte alphabet" "$out"
+	fi
+
+	# The inverse byte map is not checked separately here. Every one
+	# of the 256 byte values is a round-trip case in decode_cmp.py,
+	# so a wrong inverse fails there with the byte named. A count of
+	# how many bytes exist would have passed without touching bpec at
+	# all, which is the kind of test this repository is about not
+	# writing.
+fi
+
+# ------------------------------------------------------- hostile input# ------------------------------------------------------- hostile input
 # Byte-level BPE is defined for all 256 byte values, so there is no
 # input bpec may refuse. The library cannot be the oracle for the half
 # that is not valid UTF-8, so what is checked there is what holds
@@ -292,6 +360,16 @@ json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
 	done
 
 	out=$("$VENV/bin/python" t/encode_cmp.py "$BPEC" "$TOK2" "$BPEC_RANDOM" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "second family, $line"
+	else
+		nok "second family, $line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+
+	out=$("$VENV/bin/python" t/decode_cmp.py "$BPEC" "$TOK2" "$BPEC_RANDOM" 2>&1)
 	st=$?
 	line=$(printf '%s' "$out" | tail -1)
 	if [ "$st" -eq 0 ]; then

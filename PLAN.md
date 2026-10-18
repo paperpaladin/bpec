@@ -216,9 +216,25 @@ repeatedly.
             of it with xdup. Freed. The remaining allocations live in
             globals and are still reachable at exit, which is a design
             choice and not a leak.
-- [ ] 09 decode, and the round trip
+- [x] 09 decode, and the round trip
       why: last of the features, and weakest as an oracle, so it comes
            after the ones that can actually catch something.
+      done: and it was not the weakest after all. The ids come from
+           the library, so the decoder is tested on its own rather
+           than with encode and two matching mistakes cancelling.
+           The find: encode is not invertible when an added token
+           sets lstrip. "a<s>  <mask>b" loses its two spaces into the
+           <mask> match and nothing can put them back. Fourteen
+           failures that were the tokenizer working as designed and
+           the test comparing against the wrong thing; the oracle is
+           decode(ids, skip_special_tokens=False).
+           264 round trips over raw bytes, including all 256 values
+           alone, where the library cannot be asked and the property
+           holds anyway.
+           Five refusals, one of which needs a constructed file: a
+           vocabulary entry outside the byte alphabet. Kept because
+           removing the bounds check in front of it turns the guard
+           into an out-of-bounds read.
 - [x] 10 a second tokenizer file from a different model family
       why: one vocabulary is one data point. A second file uses the
            same machinery with different merges and would catch
