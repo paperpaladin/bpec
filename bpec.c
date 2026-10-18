@@ -1055,6 +1055,20 @@ static int encode_stdin(void)
 		if (got == 0) break;
 	}
 
+	/* Trim to exactly what was read. This matters only under a
+	 * sanitizer, and it matters a lot there. The buffer doubles, so
+	 * after reading 1 KB it is 64 KB, and a read one byte past the
+	 * end of the input lands 63 KB inside a live allocation: ASan
+	 * reports nothing, and the entire class of off-by-one past the
+	 * input is invisible to it. Found in a sibling repository, where
+	 * deleting a bounds check produced 33 wrong answers and zero
+	 * sanitizer reports until the buffer was trimmed. */
+	if (n == 0) { free(buf); buf = NULL; }
+	else {
+		unsigned char *exact = realloc(buf, n);
+		if (exact) buf = exact;
+	}
+
 	build_tables();
 	while (i < n) {
 
