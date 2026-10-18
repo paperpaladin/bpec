@@ -35,7 +35,13 @@ def main():
         except UnicodeDecodeError:
             out.append("SKIP-not-utf8")
             continue
-        out.append(" ".join(str(i) for i in tok.encode(text).ids))
+        # add_special_tokens=False: post-processing is a separate
+        # stage and bpec does not implement it. RoBERTa's wraps output
+        # in <s> and </s>; comparing against that would be grading this
+        # program on a feature it says it does not have. GPT-2's adds
+        # nothing, so no GPT-2 answer changes.
+        ids = tok.encode(text, add_special_tokens=False).ids
+        out.append(" ".join(str(i) for i in ids))
     sys.stdout.write("\n".join(out) + "\n")
 
 

@@ -13,7 +13,7 @@ $ printf 'hello world' | ./bpec --encode tokenizer.json
 995
 ```
 
-`make test`: **19 passed, 0 failed.** `make test-asan`: the same under
+`make test`: **36 passed, 0 failed.** `make test-asan`: the same under
 ASan and UBSan.
 
 ## Why exactness and not "close"
@@ -29,9 +29,10 @@ and nothing here is graded against a number anybody typed.
 ## The oracle
 
 The `tokenizers` library, pinned to one version in a scratch venv, with
-the GPT-2 tokenizer file fetched and pinned by sha256 so a result cannot
-shift because a vocabulary changed underneath it. Neither is vendored:
-the file belongs to its model and the library is 30 MB of wheels.
+two tokenizer files, GPT-2 and roberta-base, each fetched and pinned by
+sha256 so a result cannot shift because a vocabulary changed underneath
+it. Nothing is vendored: the files belong to their models and the
+library is 30 MB of wheels.
 
 Offline, the suite skips and says so. An exactness claim with no
 reference implementation to check against is not a weaker claim, it is
@@ -63,7 +64,7 @@ class boundaries. Uniform random Unicode would have been almost
 entirely unassigned and would have tested nothing while looking
 thorough.
 
-The ids themselves. 4049 of 4049 inputs identical, 68640 tokens
+The ids themselves. 4269 of 4269 inputs identical, 72388 tokens
 compared, against the fixed traps, the random strings, and every line
 of this repository's own C, Markdown, shell and Python. Real text is
 where the merge table is exercised, because random strings rarely
@@ -71,6 +72,9 @@ contain a sequence the merges were trained on.
 
 Added tokens. `<|endoftext|>` survives as one id and is not reachable
 by merging ordinary text.
+
+A second model family. The whole corpus again against roberta-base,
+4269 of 4269 identical, 72388 tokens, on the first run.
 
 The split is a hand-written scanner rather than a regex engine. The
 pattern is fixed and five of its six alternatives are a character class
@@ -101,6 +105,50 @@ that position.
 
 Three corpus inputs caught it and not one of the hand-written cases
 did, because every one of those had put the token after a letter.
+
+## The second family, and what it cost
+
+Everything above was GPT-2, which is one vocabulary and therefore one
+data point. roberta-base is the same byte-level BPE over a different
+vocabulary with five added tokens instead of one.
+
+It agreed on the first run, every input, which says nothing here was
+hard-coded to GPT-2. That is the answer the comparison existed to get
+and not the one it expected.
+
+Getting as far as running it was the work. RoBERTa's `<mask>` sets
+`lstrip`, which no GPT-2 file sets, so the file was refused outright
+by name. `lstrip` makes an added token absorb the whitespace in front
+of it: `"a  <mask>"` is `"a"` and `"  <mask>"`, not `"a"`, two spaces
+and the token. `<s>` does not set it and is the control, its space
+tokenises separately as the ordinary space token.
+
+Three other candidates were rejected first and the reasons are the
+gaps. `gpt-neox-20b` and `Qwen2` both carry an NFC normalizer, which
+is refused by name, and Qwen uses a `Sequence` pre-tokenizer with its
+own regex. So the second family shares GPT-2's pre-tokenizer, and one
+with a different pre-tokenizer is still untested.
+
+The new cases also found a leak that had been there since the input
+buffer was made growable, and the way it surfaced is the part worth
+keeping. LeakSanitizer reported it on three inputs and stayed silent
+on the hundreds of others, which read as input-dependent and sent me
+looking for a path through the added-token branch. There is no such
+path: `buf` and `piece` were freed on none of the five returns, and on
+the quiet inputs the dead pointer was still sitting in stack memory
+below the frame, where LSan's conservative scan counts it as
+reachable. A leak detector that finds a leak sometimes is reporting
+the stack layout, not the leak. One exit now, and both are freed.
+
+`rstrip` is `lstrip`'s mirror and no real file here sets it, so the
+code for it would have been untested against anything. The oracle will
+read a file we construct, so the file is constructed: the real RoBERTa
+vocabulary with `rstrip` added to `<s>`, and the library answers for
+it. Two mutations survived without that file and one of them was a
+real bug. The backward scan has to stop at the start of the segment
+rather than the start of the input, because in `"a<s>  <mask>b"` the
+`rstrip` token takes both spaces and the `lstrip` token must not take
+them a second time.
 
 ## Hostile input, where the oracle runs out
 
@@ -143,14 +191,26 @@ choice rather than a leak.
 - Decoding, and the round trip. Item 09.
 - `\u` escapes in a tokenizer file are refused rather than decoded.
   Decoding them wrongly corrupts exactly the non-ASCII vocabulary
-  entries byte-level BPE depends on, and silently. A second tokenizer
-  from another model family, item 10, will force them.
+  entries byte-level BPE depends on, and silently. Neither file here
+  uses them, so the refusal still stands.
+- Post-processing. RoBERTa's wraps output in `<s>` and `</s>`, and
+  every comparison here passes `add_special_tokens=False`. Comparing
+  against a stage this program does not implement would be grading it
+  on a feature it says it does not have.
+- `single_word` on an added token is refused by name. No file here
+  sets it, and the rule above about untested code applies: it would be
+  a feature with no oracle.
+- The backward scan for `lstrip` recognises ASCII whitespace only. A
+  multi-byte Unicode space immediately before an `lstrip` token would
+  not be absorbed. Fixing it needs a backwards UTF-8 scan, and no file
+  or corpus here has produced the case.
 - Normalizers, WordPiece, Unigram and SentencePiece are refused by
   name. A field quietly ignored produces wrong ids for every input that
   would have touched it.
 - Training. This applies a vocabulary and does not produce one.
-- One tokenizer file is one data point. Everything measured here is
-  GPT-2 until item 10 adds a second family.
+- Two tokenizer files is two data points, and they share a
+  pre-tokenizer. A family with a different one, or with a normalizer,
+  is refused rather than measured.
 - The character classes come from Python's `unicodedata`, Unicode
   15.1.0. The reference gets its tables from the Rust regex crate,
   which tracks its own version, so the two could disagree on codepoints

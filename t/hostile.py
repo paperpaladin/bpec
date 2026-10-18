@@ -30,6 +30,12 @@ import sys
 
 from tokenizers import Tokenizer
 
+# add_special_tokens=False because post-processing is a separate stage
+# and bpec does not implement it. RobertaProcessing wraps output in <s>
+# and </s>; comparing against that would be testing a feature this
+# program says it does not have. GPT-2's post-processor adds nothing,
+# so the flag changes none of its answers.
+
 
 def cases():
     out = []
@@ -125,7 +131,7 @@ def main():
         except UnicodeDecodeError:
             continue
         utf8_checked += 1
-        want = tok.encode(text).ids
+        want = tok.encode(text, add_special_tokens=False).ids
         if want != ids:
             print("  MISMATCH on valid UTF-8 %r\n    want %s\n    got  %s"
                   % (text[:40], want[:10], ids[:10]))

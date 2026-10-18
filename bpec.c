@@ -189,7 +189,7 @@ static int refused;   /* an unimplemented field was named and rejected */
  * pre-tokenizer sees it, and their id is emitted whole. They are not
  * reachable by merging: "<|endoftext|>" tokenises as ordinary text if
  * it is not matched here first, which is what the suite caught. */
-typedef struct { char *content; int id; } Added;
+typedef struct { char *content; int id; int lstrip, rstrip; } Added;
 static Added *added;
 static size_t added_n;
 static size_t merges_n;
@@ -378,7 +378,7 @@ static int load_tokenizer(const char *path)
 			if (!added) { fputs("bpec: out of memory\n", stderr); exit(1); }
 			if (!jtake(&j, '[')) { jerr(&j, "added_tokens is not an array"); break; }
 			if (!jtake(&j, ']')) for (;;) {
-				int bad_flag = 0;
+				int bad_flag = 0, want_lstrip = 0, want_rstrip = 0;
 				content[0] = 0; id = -1;
 				if (!jtake(&j, '{')) { jerr(&j, "added token is not an object"); break; }
 				if (!jtake(&j, '}')) for (;;) {
@@ -389,12 +389,18 @@ static int load_tokenizer(const char *path)
 					} else if (!strcmp(key, "id")) {
 						jspace(&j);
 						id = (int)strtol(j.p, (char **)&j.p, 10);
-					} else if (!strcmp(key, "lstrip") || !strcmp(key, "rstrip") ||
-					           !strcmp(key, "single_word")) {
-						/* Each of these changes which text the token
-						 * matches. GPT-2 sets all three false; a file
-						 * that sets one is refused rather than matched
-						 * as if it had not. */
+					} else if (!strcmp(key, "lstrip") || !strcmp(key, "rstrip")) {
+						jspace(&j);
+						if (j.end - j.p >= 4 && !strncmp(j.p, "true", 4)) {
+							if (key[0] == 'l') want_lstrip = 1;
+							else want_rstrip = 1;
+						}
+						if (!jskip(&j)) break;
+					} else if (!strcmp(key, "single_word")) {
+						/* single_word restricts the match to whole
+						 * words, which changes which text the token
+						 * matches. No file here sets it, so it is
+						 * refused rather than matched as if absent. */
 						jspace(&j);
 						if (j.end - j.p >= 4 && !strncmp(j.p, "true", 4))
 							bad_flag = 1;
@@ -406,9 +412,8 @@ static int load_tokenizer(const char *path)
 					break;
 				}
 				if (bad_flag) {
-					fprintf(stderr, "bpec: added token \"%s\" sets lstrip, "
-					        "rstrip or single_word, which is not implemented\n",
-					        content);
+					fprintf(stderr, "bpec: added token \"%s\" sets single_word, "
+					        "which is not implemented\n", content);
 					refused = 1;
 					return 0;
 				}
@@ -420,6 +425,8 @@ static int load_tokenizer(const char *path)
 					}
 					added[added_n].content = xdup(content, strlen(content));
 					added[added_n].id = id;
+					added[added_n].lstrip = want_lstrip;
+					added[added_n].rstrip = want_rstrip;
 					added_n++;
 				}
 				if (jtake(&j, ',')) continue;
@@ -901,13 +908,20 @@ static int encode_stdin(void)
 	int scan_valid = 0;
 	char *piece = NULL;
 	size_t piece_cap = 0;
+	/* One exit, because buf and piece were freed on none of the five.
+	 * LeakSanitizer reported it on three inputs out of hundreds and
+	 * not on the rest, which made it look input-dependent: the dead
+	 * pointer was still lying in stack memory below the frame on the
+	 * others, and LSan's conservative scan counted that as reachable.
+	 * The leak was there every time. */
+	int rc = 0;
 
 	for (;;) {
 		size_t got;
 		if (n == cap) {
 			cap = cap ? cap * 2 : (1 << 16);
 			buf = realloc(buf, cap);
-			if (!buf) { fputs("bpec: out of memory\n", stderr); return 1; }
+			if (!buf) { fputs("bpec: out of memory\n", stderr); rc = 1; goto done; }
 		}
 		got = fread(buf + n, 1, cap - n, stdin);
 		n += got;
@@ -936,8 +950,25 @@ static int encode_stdin(void)
 					if (n - seg < l || memcmp(buf + seg, added[a].content, l))
 						continue;
 					if (l > next_added_len) {
-						next_added_at = seg;
-						next_added_len = l;
+						size_t at = seg, end = seg + l;
+						/* lstrip pulls the preceding whitespace into
+						 * the token: RoBERTa's <mask> turns "a  <mask>"
+						 * into "a" and "  <mask>", so the two spaces
+						 * belong to the token and not to "a".
+						 * shortcut: ASCII whitespace only. A
+						 * multi-byte Unicode space immediately before
+						 * an lstrip token would not be absorbed;
+						 * upgrade needs a backwards UTF-8 scan. */
+						if (added[a].lstrip)
+							while (at > i && strchr(" \t\n\r\f\v",
+							                        buf[at - 1]))
+								at--;
+						if (added[a].rstrip)
+							while (end < n && strchr(" \t\n\r\f\v",
+							                         buf[end]))
+								end++;
+						next_added_at = at;
+						next_added_len = end - at;
 						next_added_id = added[a].id;
 					}
 				}
@@ -964,20 +995,23 @@ static int encode_stdin(void)
 		if (plen * 3 + 1 > piece_cap) {
 			piece_cap = plen * 3 + 8;
 			piece = realloc(piece, piece_cap);
-			if (!piece) { fputs("bpec: out of memory\n", stderr); return 1; }
+			if (!piece) { fputs("bpec: out of memory\n", stderr); rc = 1; goto done; }
 		}
 		if (!encode_into(piece, piece_cap - 1, buf + i, plen)) {
 			fputs("bpec: a piece did not fit its own buffer\n", stderr);
-			return 1;
+			rc = 1; goto done;
 		}
 
 		got = merge_piece(piece, ids, (int)(sizeof ids / sizeof *ids));
-		if (got < 0) return 1;
+		if (got < 0) { rc = 1; goto done; }
 		for (k = 0; k < got; k++) printf("%d\n", ids[k]);
 		i += plen;
 		}
 	}
-	return 0;
+done:
+	free(buf);
+	free(piece);
+	return rc;
 }
 
 static void usage(void)
