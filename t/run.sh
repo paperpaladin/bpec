@@ -177,5 +177,21 @@ if [ -x ./bpec ]; then
 	fi
 fi
 
+# ----------------------------------------------------------- the token ids
+# The claim the whole project exists for. Per input rather than batched:
+# a per-input comparison names the input that disagrees, where a batched
+# one reports a diff somewhere in a megabyte.
+if [ -x ./bpec ]; then
+	out=$("$VENV/bin/python" t/encode_cmp.py ./bpec "$TOK" 2000 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "$line"
+	else
+		nok "$line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

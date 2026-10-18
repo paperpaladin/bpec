@@ -8,12 +8,12 @@ HuggingFace `tokenizers` library, in the same order. Not the same count,
 not the same text when decoded: the same integers.
 
 ```
-$ ./bpec --split <<< 'hello world'
-hello
-Ġworld
+$ printf 'hello world' | ./bpec --encode tokenizer.json
+31373
+995
 ```
 
-`make test`: **17 passed, 0 failed.**
+`make test`: **18 passed, 0 failed.**
 
 ## Why exactness and not "close"
 
@@ -62,6 +62,15 @@ class boundaries. Uniform random Unicode would have been almost
 entirely unassigned and would have tested nothing while looking
 thorough.
 
+The ids themselves. 3789 of 3789 inputs identical, 64848 tokens
+compared, against the fixed traps, the random strings, and every line
+of this repository's own C, Markdown, shell and Python. Real text is
+where the merge table is exercised, because random strings rarely
+contain a sequence the merges were trained on.
+
+Added tokens. `<|endoftext|>` survives as one id and is not reachable
+by merging ordinary text.
+
 The split is a hand-written scanner rather than a regex engine. The
 pattern is fixed and five of its six alternatives are a character class
 and a plus, so a scanner is smaller and has no lookahead machinery to
@@ -80,11 +89,20 @@ rejected the vocabulary had already loaded, and the only gate was
 whether a vocabulary existed. The loader returned success while
 printing "only BPE is implemented" on the line above.
 
+## A third bug the corpus found
+
+The first version of added-token handling probed at pre-tokenizer piece
+boundaries. That misses every token which does not begin one: in
+`"<|endoftext|>"` the punctuation run matches `"<|` and steps straight
+over the start, so the token came out as thirteen ordinary tokens. The
+input is split on added tokens now, earliest match first and longest at
+that position.
+
+Three corpus inputs caught it and not one of the hand-written cases
+did, because every one of those had put the token after a letter.
+
 ## What does not work
 
-- Encoding. Items 05 and 06 are the merge loop and special tokens, so
-  `bpec` splits text and cannot yet turn it into ids. `--split` is what
-  exists.
 - Decoding, and the round trip. Item 09.
 - `\u` escapes in a tokenizer file are refused rather than decoded.
   Decoding them wrongly corrupts exactly the non-ASCII vocabulary
