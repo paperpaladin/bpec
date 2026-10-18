@@ -472,8 +472,16 @@ static int load_tokenizer(const char *path)
 	}
 	if (j.err) {
 		fprintf(stderr, "bpec: %s (at byte %ld)\n", j.err, (long)(j.p - buf));
+		free(buf);
 		return 0;
 	}
+	/* Every string taken from this file was copied out with xdup, so
+	 * the file itself is dead the moment parsing finishes. Holding
+	 * 1.3 MB for the life of the process is not a design choice, it
+	 * is just a leak, and LeakSanitizer said so. */
+	free(buf);
+	buf = NULL;
+
 	/* A refusal is a refusal whenever it happened. The "type" field
 	 * comes AFTER vocab and merges in a real file, so by the time it
 	 * is rejected the vocabulary is already loaded, and gating only on
@@ -794,19 +802,29 @@ static void build_tables(void)
  * shortcut: O(n^2) per piece; upgrade to a linked list plus a heap of
  * candidate pairs if a profile ever says a long piece dominates.
  */
-#define MAX_SYM 4096
-
 static int merge_piece(const char *piece, int *ids, int cap)
 {
-	const char *sym[MAX_SYM];
-	int len[MAX_SYM];
+	/* Sized from the piece. A fixed 4096 entries silently dropped
+	 * everything past the 4096th character of a longer piece, which
+	 * is a wrong answer that looks like a right one: the ids it does
+	 * emit are all correct. */
+	static const char **sym;
+	static int *len;
+	static size_t sym_cap;
 	char joined[1024];
 	int n = 0, i, count = 0;
 	size_t off = 0, plen = strlen(piece);
 
+	if (plen + 1 > sym_cap) {
+		sym_cap = plen + 1;
+		sym = realloc(sym, sym_cap * sizeof *sym);
+		len = realloc(len, sym_cap * sizeof *len);
+		if (!sym || !len) { fputs("bpec: out of memory\n", stderr); exit(1); }
+	}
+
 	/* One symbol per codepoint, since the piece is byte-level encoded
 	 * and every merge is over those characters. */
-	while (off < plen && n < MAX_SYM) {
+	while (off < plen) {
 		unsigned cp;
 		int l = utf8_next((const unsigned char *)piece + off, plen - off, &cp);
 		if (l == 0) l = 1;
@@ -865,51 +883,91 @@ static int merge_piece(const char *piece, int *ids, int cap)
 
 static int encode_stdin(void)
 {
-	static unsigned char buf[1 << 20];
+	/* The whole of stdin, however large. A fixed buffer here read the
+	 * first megabyte and dropped the rest without a word: 1.2 MB of
+	 * input produced 524289 ids and looked like a successful run.
+	 * Silent truncation in a tokenizer is worse than a refusal,
+	 * because the ids it did emit are all correct. */
+	unsigned char *buf = NULL;
+	size_t n = 0, cap = 0, i = 0, seg;
 	static int ids[1 << 16];
-	size_t n = fread(buf, 1, sizeof buf, stdin), i = 0;
+	size_t next_added_at = 0, next_added_len = 0;
+	int next_added_id = -1;
+	/* Explicit, because "next_added_at < i" is false at i = 0 and the
+	 * scan then never ran for the first piece. Everything still
+	 * worked whenever the first piece did not reach the token, which
+	 * is why every hand-written case passed and a line of this
+	 * repository's own README did not. */
+	int scan_valid = 0;
+	char *piece = NULL;
+	size_t piece_cap = 0;
+
+	for (;;) {
+		size_t got;
+		if (n == cap) {
+			cap = cap ? cap * 2 : (1 << 16);
+			buf = realloc(buf, cap);
+			if (!buf) { fputs("bpec: out of memory\n", stderr); return 1; }
+		}
+		got = fread(buf + n, 1, cap - n, stdin);
+		n += got;
+		if (got == 0) break;
+	}
 
 	build_tables();
 	while (i < n) {
-		char piece[4096];
-		size_t a, seg;
-		size_t hit_at = n, hit_len = 0;
-		int hit_id = -1;
 
-		/* The input is SPLIT on added tokens, not probed at piece
-		 * boundaries. Probing at boundaries was the first version
-		 * and it missed every token that does not start one: in
-		 * "\"<|endoftext|>\"" the punctuation run matches "\"<|" and
-		 * steps straight over the start, so the token tokenised as
-		 * ordinary text. Three corpus inputs caught it.
-		 *
-		 * Earliest match wins, and the longest at that position, so
-		 * two added tokens sharing a prefix cannot have the shorter
-		 * swallow the longer. */
-		for (seg = i; seg < n && hit_id < 0; seg++) {
-			for (a = 0; a < added_n; a++) {
-				size_t l = strlen(added[a].content);
-				if (n - seg < l || memcmp(buf + seg, added[a].content, l))
-					continue;
-				if (l > hit_len) { hit_at = seg; hit_len = l; hit_id = added[a].id; }
+		size_t a;
+
+		/* Where the next added token starts, found once and kept.
+		 * The first version searched from the current position to
+		 * the end of input for every piece, which is quadratic in
+		 * the input: 1.2 MB of ordinary words did not finish at
+		 * all. The scan runs only when the cached answer has been
+		 * passed. */
+		if (!scan_valid || next_added_at < i) {
+			next_added_at = n;
+			next_added_len = 0;
+			next_added_id = -1;
+			scan_valid = 1;
+			for (seg = i; seg < n; seg++) {
+				for (a = 0; a < added_n; a++) {
+					size_t l = strlen(added[a].content);
+					if (n - seg < l || memcmp(buf + seg, added[a].content, l))
+						continue;
+					if (l > next_added_len) {
+						next_added_at = seg;
+						next_added_len = l;
+						next_added_id = added[a].id;
+					}
+				}
+				if (next_added_id >= 0) break;
 			}
 		}
 
-		/* Nothing of the added token is in this segment, so the
-		 * ordinary path runs up to where it starts. */
-		if (hit_id >= 0 && hit_at == i) {
-			printf("%d\n", hit_id);
-			i += hit_len;
+		if (next_added_id >= 0 && next_added_at == i) {
+			printf("%d\n", next_added_id);
+			i += next_added_len;
+			scan_valid = 0;         /* force a rescan past this one */
 			continue;
 		}
 		{
 		/* Stop the ordinary path where the added token begins. */
-		size_t limit = (hit_id >= 0) ? hit_at : n;
+		size_t limit = (next_added_id >= 0) ? next_added_at : n;
 		size_t plen = next_piece(buf + i, limit - i);
 		int got, k;
 
-		if (!encode_into(piece, sizeof piece - 1, buf + i, plen)) {
-			fputs("bpec: a piece is too long to encode\n", stderr);
+		/* Three bytes of UTF-8 per input byte at most, so the piece
+		 * buffer is sized from the piece rather than fixed. A fixed
+		 * 4096 refused a 5000-byte run of one character, which the
+		 * reference tokenises without complaint. */
+		if (plen * 3 + 1 > piece_cap) {
+			piece_cap = plen * 3 + 8;
+			piece = realloc(piece, piece_cap);
+			if (!piece) { fputs("bpec: out of memory\n", stderr); return 1; }
+		}
+		if (!encode_into(piece, piece_cap - 1, buf + i, plen)) {
+			fputs("bpec: a piece did not fit its own buffer\n", stderr);
 			return 1;
 		}
 

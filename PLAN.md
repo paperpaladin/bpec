@@ -177,11 +177,45 @@ repeatedly.
       ids compared
       why: the number this project lives or dies by. Millions of
            comparisons, not dozens.
-- [ ] 08 a hostile-input sweep: lone surrogates, truncated UTF-8, NUL,
+- [x] 08 a hostile-input sweep: lone surrogates, truncated UTF-8, NUL,
       very long runs, every byte 0 to 255
       why: input is untrusted text and the byte-level mapping is
            defined for all 256 bytes, so there is no excuse for a
            crash.
+      files: t/hostile.py Makefile bpec.c t/run.sh
+      proves: 299 inputs survive, 141 of them also matching the
+              reference. The library cannot answer for the other 158
+              because it takes str and cannot be handed bytes that are
+              not text, so those are held to what holds regardless: it
+              terminates, exits 0, emits ids inside the vocabulary, and
+              gives the same answer twice. Splitting the corpus that
+              way rather than skipping the invalid half is the
+              difference between testing this and claiming to.
+      found: four defects, none of which the earlier corpora could see.
+             A 1 MB static input buffer SILENTLY TRUNCATED anything
+             larger. 1.2 MB of input produced 524289 ids and looked
+             like a clean run, because every id it did emit was right.
+             merge_piece capped at 4096 symbols and dropped the rest of
+             a longer piece, the same shape of wrong answer.
+             A 4096-byte piece buffer refused a 5000-character word,
+             which the reference tokenises without complaint.
+             The added-token scan restarted at every piece and ran to
+             end of input, making encoding quadratic: 1.2 MB of
+             ordinary words did not finish at all. Cached now, 0.1s.
+      found: and one more from the corpus itself, after the cache was
+             added. The cache validity test was `next_added_at < i`,
+             which is false at i = 0, so the scan never ran for the
+             first piece. Every hand-written case passed because none
+             of them had the token early enough to matter; a line of
+             this repository's own README did not, because it quotes
+             the token after a backtick and a quote. The flag is
+             explicit now.
+      note: `make test-asan` added. LeakSanitizer immediately found a
+            real 1.3 MB leak: the tokenizer file was read into a local
+            buffer and never freed, though every string is copied out
+            of it with xdup. Freed. The remaining allocations live in
+            globals and are still reachable at exit, which is a design
+            choice and not a leak.
 - [ ] 09 decode, and the round trip
       why: last of the features, and weakest as an oracle, so it comes
            after the ones that can actually catch something.

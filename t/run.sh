@@ -14,6 +14,9 @@ TOK_SHA=8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6
 TOK=scratch/gpt2-tokenizer.json
 VENV=scratch/venv
 LIB_VERSION=0.23.3
+: "${BPEC:=./bpec}"
+# Fewer random cases under a sanitizer, which costs about 20x per run.
+: "${BPEC_RANDOM:=2000}"
 
 pass=0
 fail=0
@@ -97,20 +100,20 @@ PY
 n=$(sort -n scratch/alphabet.txt | uniq | wc -l)
 eq "the byte-level alphabet has 256 distinct codepoints" "256" "$n"
 
-if [ -x ./bpec ]; then
-	ours=$(./bpec --alphabet | sort -n | uniq | md5sum | cut -d' ' -f1)
+if [ -x "$BPEC" ]; then
+	ours=$("$BPEC" --alphabet | sort -n | uniq | md5sum | cut -d' ' -f1)
 	theirs=$(sort -n scratch/alphabet.txt | uniq | md5sum | cut -d' ' -f1)
 	eq "our byte-level alphabet is the library's, character for character" \
 	   "$theirs" "$ours"
 else
-	skip "bpec is not built yet, so only the oracle side ran"
+	skip "$BPEC is not built yet, so only the oracle side ran"
 fi
 
 # --------------------------------------------- reading the tokenizer file
-if [ -x ./bpec ]; then
+if [ -x "$BPEC" ]; then
 	want_v=$("$VENV/bin/python" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["model"]["vocab"]))' "$TOK")
 	want_m=$("$VENV/bin/python" -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["model"]["merges"]))' "$TOK")
-	got=$(./bpec --load "$TOK")
+	got=$("$BPEC" --load "$TOK")
 	eq "the vocabulary size is the file's" "vocab $want_v" "$(echo "$got" | sed -n 1p)"
 	eq "the merge count is the file's" "merges $want_m" "$(echo "$got" | sed -n 2p)"
 
@@ -126,7 +129,7 @@ d = json.load(open(sys.argv[1]))
 $2
 json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
 " "$TOK" "scratch/bad/$1.json" || { nok "refuses $1" "could not build the case"; return 0; }
-		out=$(./bpec --load "scratch/bad/$1.json" 2>&1)
+		out=$("$BPEC" --load "scratch/bad/$1.json" 2>&1)
 		st=$?
 		if [ "$st" -eq 0 ]; then
 			nok "refuses $1" "it was accepted"
@@ -151,7 +154,7 @@ json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
 import json, sys
 json.dump(json.load(open(sys.argv[1])), open(sys.argv[2], 'w'), ensure_ascii=True)
 " "$TOK" scratch/bad/uesc.json
-	out=$(./bpec --load scratch/bad/uesc.json 2>&1)
+	out=$("$BPEC" --load scratch/bad/uesc.json 2>&1)
 	if [ $? -eq 0 ]; then
 		nok "refuses a file written with backslash-u escapes" "it was accepted"
 	elif printf '%s' "$out" | grep -q 'u escapes'; then
@@ -165,8 +168,8 @@ fi
 # Compared split by split, before any merging. A wrong split produces
 # wrong ids with a merge table that is working perfectly, so a failure
 # here has to say "the split is wrong" and not "the ids differ".
-if [ -x ./bpec ]; then
-	out=$("$VENV/bin/python" t/split_cmp.py ./bpec 2000 2>&1)
+if [ -x "$BPEC" ]; then
+	out=$("$VENV/bin/python" t/split_cmp.py "$BPEC" "$BPEC_RANDOM" 2>&1)
 	st=$?
 	line=$(printf '%s' "$out" | tail -1)
 	if [ "$st" -eq 0 ]; then
@@ -181,8 +184,27 @@ fi
 # The claim the whole project exists for. Per input rather than batched:
 # a per-input comparison names the input that disagrees, where a batched
 # one reports a diff somewhere in a megabyte.
-if [ -x ./bpec ]; then
-	out=$("$VENV/bin/python" t/encode_cmp.py ./bpec "$TOK" 2000 2>&1)
+if [ -x "$BPEC" ]; then
+	out=$("$VENV/bin/python" t/encode_cmp.py "$BPEC" "$TOK" "$BPEC_RANDOM" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	if [ "$st" -eq 0 ]; then
+		ok "$line"
+	else
+		nok "$line"
+		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
+	fi
+fi
+
+# ------------------------------------------------------- hostile input
+# Byte-level BPE is defined for all 256 byte values, so there is no
+# input bpec may refuse. The library cannot be the oracle for the half
+# that is not valid UTF-8, so what is checked there is what holds
+# regardless: it terminates, exits 0, emits ids inside the vocabulary,
+# and gives the same answer twice. The valid half is still compared
+# against the reference rather than waved through.
+if [ -x "$BPEC" ]; then
+	out=$("$VENV/bin/python" t/hostile.py "$BPEC" "$TOK" 2>&1)
 	st=$?
 	line=$(printf '%s' "$out" | tail -1)
 	if [ "$st" -eq 0 ]; then
