@@ -24,6 +24,11 @@ LIB_VERSION=0.23.3
 : "${BPEC:=./bpec}"
 # Fewer random cases under a sanitizer, which costs about 20x per run.
 : "${BPEC_RANDOM:=2000}"
+# Bytes of real text to sweep. Not vendored and not downloaded: the
+# corpus is whatever large body of text is installed here, by default
+# the top of the Python standard library. BPEC_CORPUS points it
+# elsewhere.
+: "${BPEC_CORPUS_BYTES:=4000000}"
 
 pass=0
 fail=0
@@ -210,7 +215,37 @@ if [ -x "$BPEC" ]; then
 	fi
 fi
 
-# ---------------------------------------------------------- decode
+# ------------------------------------------------ megabytes of real text
+# Volume, and real text specifically. Random strings almost never
+# contain a sequence the merges were trained on, so a random corpus
+# can agree perfectly while saying nothing about the part of the merge
+# table that real input actually reaches.
+#
+# Compared per file, because a line is one subprocess and four
+# megabytes is a hundred thousand of them. On a mismatch it bisects to
+# the smallest failing line, so a failure still names something a
+# person can read rather than "somewhere in 4 MB".
+#
+# The corpus is not vendored, not downloaded, and differs between
+# machines, so the suite reports what it swept rather than asserting a
+# number. It skips loudly when there is nothing large to read.
+if [ -x "$BPEC" ]; then
+	out=$("$VENV/bin/python" t/corpus_cmp.py "$BPEC" "$TOK" \
+	      "$BPEC_CORPUS_BYTES" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	case "$line" in
+		SKIP*) printf 'SKIP  %s\n' "$line" ;;
+		*) if [ "$st" -eq 0 ]; then
+		     ok "$line"
+		   else
+		     nok "$line"
+		     printf '%s\n' "$out" | head -14 | sed 's/^/        /'
+		   fi ;;
+	esac
+fi
+
+# ---------------------------------------------------------- decode# ---------------------------------------------------------- decode
 # The ids come from the library and so does the expected text, so
 # this tests the decoder on its own rather than testing encode and
 # decode together and letting two matching mistakes cancel.
@@ -368,6 +403,20 @@ json.dump(d, open(sys.argv[2], 'w'), ensure_ascii=False)
 		nok "second family, $line"
 		printf '%s\n' "$out" | head -20 | sed 's/^/        /'
 	fi
+
+	out=$("$VENV/bin/python" t/corpus_cmp.py "$BPEC" "$TOK2" \
+	      "$BPEC_CORPUS_BYTES" 2>&1)
+	st=$?
+	line=$(printf '%s' "$out" | tail -1)
+	case "$line" in
+		SKIP*) printf 'SKIP  second family, %s\n' "$line" ;;
+		*) if [ "$st" -eq 0 ]; then
+		     ok "second family, $line"
+		   else
+		     nok "second family, $line"
+		     printf '%s\n' "$out" | head -14 | sed 's/^/        /'
+		   fi ;;
+	esac
 
 	out=$("$VENV/bin/python" t/decode_cmp.py "$BPEC" "$TOK2" "$BPEC_RANDOM" 2>&1)
 	st=$?

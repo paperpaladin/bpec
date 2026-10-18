@@ -13,7 +13,7 @@ $ printf 'hello world' | ./bpec --encode tokenizer.json
 995
 ```
 
-`make test`: **43 passed, 0 failed.** `make test-asan`: the same under
+`make test`: **45 passed, 0 failed.** `make test-asan`: the same under
 ASan and UBSan, clean, and it takes about an hour. The corpus is
 thousands of separate runs and each one loads a 50257-entry
 vocabulary; under a sanitizer that is twenty times slower. It is slow
@@ -188,6 +188,35 @@ first run: the tokenizer file was read into a local buffer and never
 freed, though every string is copied out of it. The remaining
 allocations live in globals and are still reachable at exit, which is a
 choice rather than a leak.
+
+## Four megabytes of real text
+
+1824803 tokens over 144 files and 4017774 bytes of the Python
+standard library as installed on this machine, identical to the
+library for both tokenizer families on the first run.
+
+Volume is half the point and realism is the other half. Random
+strings almost never contain a sequence the merges were trained on,
+so a random corpus can agree perfectly while saying nothing about the
+part of the merge table that real input actually reaches.
+
+The corpus is not vendored and not downloaded: it is whatever large
+body of text the machine already has, so the suite reports what it
+swept rather than asserting a number that would be wrong on another
+machine. It skips loudly when there is nothing large to read, and
+also when the directory exists but holds far less than asked for,
+because a sweep that swept almost nothing would otherwise report
+success.
+
+Comparison is per file, because a line is one subprocess and four
+megabytes is a hundred thousand of them. A mismatch bisects the file
+to the smallest failing line and prints it with both id sequences, so
+a failure names something a person can read instead of "somewhere in
+4 MB". That path was checked by planting a merge-rank defect rather
+than assumed to work.
+
+Thirteen seconds per family. The ASan target sweeps a tenth of it,
+since a sanitizer costs about twenty times per run.
 
 ## Decode, and where encode stops being invertible
 
