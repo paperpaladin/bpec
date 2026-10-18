@@ -67,7 +67,7 @@ class boundaries. Uniform random Unicode would have been almost
 entirely unassigned and would have tested nothing while looking
 thorough.
 
-The ids themselves. 4269 of 4269 inputs identical, 72388 tokens
+The ids themselves. 4949 of 4949 inputs identical, 81666 tokens
 compared, against the fixed traps, the random strings, and every line
 of this repository's own C, Markdown, shell and Python. Real text is
 where the merge table is exercised, because random strings rarely
@@ -77,7 +77,7 @@ Added tokens. `<|endoftext|>` survives as one id and is not reachable
 by merging ordinary text.
 
 A second model family. The whole corpus again against roberta-base,
-4269 of 4269 identical, 72388 tokens, on the first run.
+4949 of 4949 identical, 81566 tokens, on the first run.
 
 The split is a hand-written scanner rather than a regex engine. The
 pattern is fixed and five of its six alternatives are a character class
@@ -228,7 +228,7 @@ fact to be wrong and the two would disagree only for the 68 bytes
 that do not stand for themselves, which is the half nobody checks by
 eye.
 
-4297 decodes against the library per tokenizer, and the ids come from
+4540 decodes against the library per tokenizer, and the ids come from
 the library rather than from us, so this is the decoder on its own
 rather than encode and decode together with two matching mistakes
 cancelling.

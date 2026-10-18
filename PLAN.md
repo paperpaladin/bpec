@@ -288,5 +288,13 @@ repeatedly.
            "a<s>  <mask>b" the rstrip token takes both spaces and the
            lstrip token must not take them a second time.
            Seven mutations, all caught.
-- [ ] 11 README with the measured agreement rate and what does not work
+- [x] 11 README with the measured agreement rate and what does not work
       why: last, so the numbers in it are the numbers the suite prints.
+      done: and three of them were not. The encode line still said
+           4269 inputs and 72388 tokens where the suite now runs 4949
+           and 81666, and the decode line said 4297 where it runs
+           4540, all because this repository's own files are part of
+           the corpus and the corpus grew every time a file was
+           added. A document that quotes its own suite drifts every
+           commit unless somebody re-reads it against the output,
+           which is what this item is.
