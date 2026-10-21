@@ -2,3 +2,4 @@
 /bpec-asan
 /bpec-probe
 /scratch/
+__pycache__/
